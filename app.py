@@ -402,7 +402,28 @@ with players_tab:
 
         # Show the selected season's stats in a readable table.
         if not season_details.empty:
-            st.dataframe(
+                       # Calculate per-game averages for this season.
+            games = pd.to_numeric(
+                season_details["GamesPlayed"], errors="coerce"
+            )
+
+            for stat in ["Points", "Rebounds", "Assists", "Steals",
+                         "Blocks", "Turnovers"]:
+                if stat in season_details.columns:
+                    season_details[f"{stat}PerGame"] = (
+                        pd.to_numeric(season_details[stat], errors="coerce")
+                        / games
+                    ).where(games > 0).round(1)
+
+            visible_stats = [
+                column for column in preferred_stats
+                if column in season_details.columns
+            ] + [
+                f"{stat}PerGame"
+                for stat in ["Points", "Rebounds", "Assists", "Steals",
+                             "Blocks", "Turnovers"]
+                if f"{stat}PerGame" in season_details.columns
+            ] st.dataframe(
                 season_details[visible_stats],
                 use_container_width=True,
                 hide_index=True
