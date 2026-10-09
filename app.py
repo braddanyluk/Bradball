@@ -331,7 +331,7 @@ with players_tab:
 
     st.markdown("#### Season history")
 
-        st.markdown("#### Season history")
+
 
     preferred_stats = [
         "Season", "Age", "Tm", "G", "GS", "MP",
