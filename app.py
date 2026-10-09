@@ -433,9 +433,7 @@ with players_tab:
                 use_container_width=True,
                 hide_index=True
             )
-            else:
-        st.info("Season information is not available for this player.")
-                    column.metric(label, display_value)
+    
 
     else:
         st.info("Season information is not available for this player.")
