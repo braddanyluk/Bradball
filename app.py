@@ -39,8 +39,11 @@ st.markdown("""
     }
 
     [data-testid="stHeader"] {
-        background-color: #101318;
-    }
+    background-color: #101318;
+    position: sticky;
+    top: 0;
+    z-index: 999;
+}
 
     [data-testid="stSidebar"] {
         background-color: #171B22;
