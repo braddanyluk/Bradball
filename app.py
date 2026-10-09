@@ -423,6 +423,7 @@ with players_tab:
                 for stat in ["Points", "Rebounds", "Assists", "Steals",
                              "Blocks", "Turnovers"]
                 if f"{stat}PerGame" in season_details.columns
+           
             ] st.dataframe(
                 season_details[visible_stats],
                 use_container_width=True,
