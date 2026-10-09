@@ -381,7 +381,7 @@ with players_tab:
         "LiveBallTurnovers", "BadPassTurnovers",
         "LostBallTurnovers",
     ]
-    ]
+    
 
     visible_stats = [
         column for column in preferred_stats
