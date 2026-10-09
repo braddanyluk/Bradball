@@ -349,7 +349,7 @@ with players_tab:
 
 
 
-        preferred_stats = [
+    preferred_stats = [
         # Season and playing time
         "Season", "Age", "Tm", "GamesPlayed", "G",
         "Minutes", "MP", "SecondsPlayed",
