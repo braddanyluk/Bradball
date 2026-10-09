@@ -331,6 +331,8 @@ with players_tab:
 
     st.markdown("#### Season history")
 
+        st.markdown("#### Season history")
+
     preferred_stats = [
         "Season", "Age", "Tm", "G", "GS", "MP",
         "PTS", "TRB", "AST", "STL", "BLK", "TOV",
@@ -342,18 +344,63 @@ with players_tab:
         if column in player_df.columns
     ]
 
-    if visible_stats:
-        st.dataframe(
-            player_df[visible_stats],
-            use_container_width=True,
-            hide_index=True
+    if "Season" in player_df.columns and not player_df.empty:
+        seasons = player_df["Season"].astype(str).tolist()
+
+        selected_season = st.selectbox(
+            "Choose a season for the full statistical breakdown",
+            seasons,
+            key="selected_season"
         )
+
+        season_details = player_df[
+            player_df["Season"].astype(str) == selected_season
+        ].copy()
+
+        st.markdown(f"### {selected_season} — Season Statistics")
+
+        # Show the selected season's stats in a readable table.
+        if not season_details.empty:
+            st.dataframe(
+                season_details[visible_stats],
+                use_container_width=True,
+                hide_index=True
+            )
+
+            # Highlight some key statistics when available.
+            key_stats = [
+                ("Points", "PTS"),
+                ("Rebounds", "TRB"),
+                ("Assists", "AST"),
+                ("Games", "G"),
+                ("Minutes", "MP"),
+            ]
+
+            available_stats = [
+                (label, column)
+                for label, column in key_stats
+                if column in season_details.columns
+            ]
+
+            if available_stats:
+                st.markdown("#### Key statistics")
+                stat_columns = st.columns(len(available_stats))
+
+                for column, (label, stat) in zip(
+                    stat_columns, available_stats
+                ):
+                    value = pd.to_numeric(
+                        season_details[stat], errors="coerce"
+                    ).iloc[0]
+
+                    display_value = (
+                        f"{value:,.1f}" if pd.notna(value) else "—"
+                    )
+
+                    column.metric(label, display_value)
+
     else:
-        st.dataframe(
-            player_df,
-            use_container_width=True,
-            hide_index=True
-        )
+        st.info("Season information is not available for this player.")
 
     if "Season" in player_df.columns and "PTS" in player_df.columns:
         st.markdown("#### Scoring across seasons")
