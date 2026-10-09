@@ -175,6 +175,22 @@ def load_data():
     data["player_name"] = data["player_id"].map(name_lookup)
     data["player_name"] = data["player_name"].fillna("Unknown player")
 
+        # Compatibility aliases for the existing app interface.
+    column_map = {
+        "GamesPlayed": "G",
+        "Points": "PTS",
+        "Rebounds": "TRB",
+        "Assists": "AST",
+        "Steals": "STL",
+        "Blocks": "BLK",
+        "Turnovers": "TOV",
+        "Minutes": "MP",
+    }
+
+    for source, target in column_map.items():
+        if source in data.columns:
+            data[target] = data[source]
+
     return data
 
 
@@ -333,10 +349,38 @@ with players_tab:
 
 
 
-    preferred_stats = [
-        "Season", "Age", "Tm", "G", "GS", "MP",
-        "PTS", "TRB", "AST", "STL", "BLK", "TOV",
-        "FG%", "3P%", "FT%", "PER", "WS", "VORP"
+        preferred_stats = [
+        # Season and playing time
+        "Season", "Age", "Tm", "GamesPlayed", "G",
+        "Minutes", "MP", "SecondsPlayed",
+
+        # Traditional production
+        "Points", "PTS", "Rebounds", "TRB",
+        "Assists", "AST", "Steals", "STL",
+        "Blocks", "BLK", "Turnovers", "TOV",
+        "PlusMinus",
+
+        # Shooting
+        "FG2M", "FG2A", "FG3M", "FG3A",
+        "FtPoints", "AtRimFGM", "AtRimFGA",
+        "ShortMidRangeFGM", "ShortMidRangeFGA",
+        "LongMidRangeFGM", "LongMidRangeFGA",
+        "Corner3FGM", "Corner3FGA",
+        "Arc3FGA",
+
+        # Passing and shot creation
+        "PtsAssisted2s", "PtsUnassisted2s",
+        "PtsAssisted3s", "PtsUnassisted3s",
+        "TwoPtAssists", "ThreePtAssists",
+
+        # Rebounding
+        "OffRebounds", "DefRebounds",
+
+        # Possessions and ball security
+        "OffPoss", "DefPoss", "TotalPoss",
+        "LiveBallTurnovers", "BadPassTurnovers",
+        "LostBallTurnovers",
+    ]
     ]
 
     visible_stats = [
