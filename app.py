@@ -433,7 +433,62 @@ with players_tab:
                 use_container_width=True,
                 hide_index=True
             )
+        with st.expander("🔬 Explore All Available Stats", expanded=False):
+            st.write(
+                "Inspect the detailed statistics available for this player-season."
+            )
 
+            # Start with the selected season's data.
+            raw_data = season_details.copy()
+
+            # Remove compatibility aliases that duplicate existing statistics.
+            duplicate_aliases = [
+                "G", "PTS", "TRB", "AST",
+                "STL", "BLK", "TOV", "MP"
+            ]
+
+            raw_data = raw_data.drop(
+                columns=[
+                    col for col in duplicate_aliases
+                    if col in raw_data.columns
+                ],
+                errors="ignore"
+            )
+
+            # Remove calculated per-game columns; these are already displayed.
+            raw_data = raw_data.drop(
+                columns=[
+                    col for col in raw_data.columns
+                    if col.endswith("PerGame")
+                ],
+                errors="ignore"
+            )
+
+            search_term = st.text_input(
+                "Search statistic names",
+                placeholder="Try: turnover, assist, rim, possession...",
+                key="raw_data_search"
+            )
+
+            # Filter columns by their names, not by their values.
+            if search_term.strip():
+                matching_columns = [
+                    col for col in raw_data.columns
+                    if search_term.lower() in str(col).lower()
+                ]
+
+                if matching_columns:
+                    raw_data = raw_data[matching_columns]
+                else:
+                    st.info("No statistic names matched that search.")
+
+            st.caption(f"Showing {len(raw_data.columns)} columns")
+
+            st.dataframe(
+                raw_data,
+                use_container_width=True,
+                hide_index=True
+            )
             # Highlight some key statistics when available.
             key_stats = [
                 ("Points", "PTS"),
