@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 from pathlib import Path
@@ -15,6 +14,7 @@ st.set_page_config(
 )
 
 DATA_FILE = Path(__file__).parent / "player_seasons.csv.gz"
+NAME_FILE = Path(__file__).parent / "player_team_seasons.csv"
 
 # --------------------------------------------------
 # CUSTOM DESIGN
@@ -24,7 +24,18 @@ st.markdown("""
 <style>
     .stApp {
         background-color: #101318;
-        color: #F1F3F5;
+        color: #FFFFFF;
+    }
+
+    /* Improve text contrast throughout the app */
+    .stApp p,
+    .stApp span,
+    .stApp label,
+    .stApp li,
+    [data-testid="stMarkdownContainer"],
+    [data-testid="stWidgetLabel"],
+    [data-testid="stCaptionContainer"] {
+        color: #FFFFFF;
     }
 
     [data-testid="stHeader"] {
@@ -35,8 +46,8 @@ st.markdown("""
         background-color: #171B22;
     }
 
-    h1, h2, h3 {
-        color: #F5F5F5;
+    h1, h2, h3, h4 {
+        color: #FFFFFF;
         letter-spacing: -0.5px;
     }
 
@@ -60,7 +71,7 @@ st.markdown("""
 
     .hero-subtitle {
         font-size: 17px;
-        color: #A8B0BD;
+        color: #D0D0D0;
         margin-top: 12px;
         margin-bottom: 22px;
     }
@@ -86,7 +97,7 @@ st.markdown("""
     }
 
     div[data-testid="stMetricLabel"] {
-        color: #A8B0BD;
+        color: #FFFFFF;
     }
 
     div[data-testid="stMetricValue"] {
@@ -95,6 +106,7 @@ st.markdown("""
 
     div[data-testid="stTabs"] button {
         font-weight: 700;
+        color: #FFFFFF;
     }
 
     div[data-testid="stTabs"] button[aria-selected="true"] {
@@ -115,7 +127,7 @@ st.markdown("""
         border-top: 1px solid #2A303B;
         margin-top: 35px;
         padding-top: 18px;
-        color: #87909E;
+        color: #D0D0D0;
         font-size: 12px;
     }
 
@@ -141,9 +153,27 @@ def load_data():
         low_memory=False
     )
 
-    # Normalize IDs so searches work consistently.
-    if "player_id" in data.columns:
-        data["player_id"] = data["player_id"].astype("string")
+    names = pd.read_csv(NAME_FILE, low_memory=False)
+
+    # Make player IDs consistent between the two files.
+    data["player_id"] = data["player_id"].astype("string").str.strip()
+    names["player_id"] = names["player_id"].astype("string").str.strip()
+
+    # Clean the name mapping.
+    names = names.dropna(subset=["player_id", "player"])
+
+    names["player"] = names["player"].astype(str).str.strip()
+    names = names[names["player"] != ""]
+
+    # Each player ID should map to one display name.
+    name_lookup = (
+        names.drop_duplicates("player_id")
+        .set_index("player_id")["player"]
+    )
+
+    # Add names to every player-season record.
+    data["player_name"] = data["player_id"].map(name_lookup)
+    data["player_name"] = data["player_name"].fillna("Unknown player")
 
     return data
 
@@ -152,11 +182,14 @@ def load_data():
 # HEADER
 # --------------------------------------------------
 
-st.markdown('<div class="brand">BRADBALL / BASKETBALL RESEARCH</div>',
-            unsafe_allow_html=True)
+st.markdown(
+    '<div class="brand">BRADBALL / BASKETBALL RESEARCH</div>',
+    unsafe_allow_html=True
+)
 
 st.markdown(
-    '<div class="hero-title">The game is bigger<br>than <span class="accent">the stars.</span></div>',
+    '<div class="hero-title">The game is bigger<br>than '
+    '<span class="accent">the stars.</span></div>',
     unsafe_allow_html=True
 )
 
@@ -180,17 +213,50 @@ if not DATA_FILE.exists():
     )
     st.stop()
 
+if not NAME_FILE.exists():
+    st.error(
+        "Player-name database not found. Make sure "
+        "`player_team_seasons.csv` is in the same repository folder as `app.py`."
+    )
+    st.stop()
+
 try:
     df = load_data()
 except Exception as error:
-    st.error(f"Unable to load the player database: {error}")
+    st.error(f"Unable to load the databases: {error}")
     st.stop()
 
-if "player_id" not in df.columns:
-    st.error("The dataset is missing the required player_id column.")
+required_columns = ["player_id", "player_name"]
+
+if not all(column in df.columns for column in required_columns):
+    st.error("The database is missing a required player ID or name column.")
     st.stop()
 
-player_ids = sorted(df["player_id"].dropna().unique().tolist())
+# One display label per player ID.
+player_lookup = (
+    df[["player_id", "player_name"]]
+    .dropna(subset=["player_id"])
+    .drop_duplicates("player_id")
+    .copy()
+)
+
+player_lookup["player_label"] = (
+    player_lookup["player_name"].astype(str)
+    + " ("
+    + player_lookup["player_id"].astype(str)
+    + ")"
+)
+
+player_lookup = player_lookup.sort_values(
+    "player_name",
+    key=lambda column: column.str.lower()
+)
+
+player_options = dict(
+    zip(player_lookup["player_label"], player_lookup["player_id"])
+)
+
+player_labels = list(player_options.keys())
 
 # --------------------------------------------------
 # DATABASE OVERVIEW
@@ -198,20 +264,9 @@ player_ids = sorted(df["player_id"].dropna().unique().tolist())
 
 overview1, overview2, overview3 = st.columns(3)
 
-overview1.metric(
-    "PLAYER-SEASONS",
-    f"{len(df):,}"
-)
-
-overview2.metric(
-    "UNIQUE PLAYERS",
-    f"{df['player_id'].nunique():,}"
-)
-
-overview3.metric(
-    "STAT COLUMNS",
-    f"{len(df.columns):,}"
-)
+overview1.metric("PLAYER-SEASONS", f"{len(df):,}")
+overview2.metric("UNIQUE PLAYERS", f"{df['player_id'].nunique():,}")
+overview3.metric("STAT COLUMNS", f"{len(df.columns):,}")
 
 st.write("")
 
@@ -241,19 +296,21 @@ with players_tab:
         "Examine a player's seasons, production, and development over time."
     )
 
-    selected_id = st.selectbox(
-        "Player ID",
-        player_ids,
+    selected_label = st.selectbox(
+        "Choose a player",
+        player_labels,
         key="explorer_player",
-        help="We'll replace this with player-name search when we connect the name mapping."
     )
+
+    selected_id = player_options[selected_label]
 
     player_df = df[df["player_id"] == selected_id].copy()
 
     if "Season" in player_df.columns:
         player_df = player_df.sort_values("Season")
 
-    # Useful career overview metrics.
+    st.markdown(f"### {player_df['player_name'].iloc[0]}")
+
     metric_columns = st.columns(3)
 
     if "G" in player_df.columns:
@@ -270,10 +327,7 @@ with players_tab:
             f"{points.mean():.1f}" if points.notna().any() else "—"
         )
 
-    metric_columns[2].metric(
-        "Seasons",
-        f"{len(player_df)}"
-    )
+    metric_columns[2].metric("Seasons", f"{len(player_df)}")
 
     st.markdown("#### Season history")
 
@@ -336,20 +390,27 @@ with compare_tab:
     left, right = st.columns(2)
 
     with left:
-        first_id = st.selectbox(
-            "First player ID",
-            player_ids,
+        first_label = st.selectbox(
+            "First player",
+            player_labels,
             key="compare_first"
         )
 
-    alternative_ids = [pid for pid in player_ids if pid != first_id]
+    first_id = player_options[first_label]
+
+    alternative_labels = [
+        label for label in player_labels
+        if player_options[label] != first_id
+    ]
 
     with right:
-        second_id = st.selectbox(
-            "Second player ID",
-            alternative_ids,
+        second_label = st.selectbox(
+            "Second player",
+            alternative_labels,
             key="compare_second"
         )
+
+    second_id = player_options[second_label]
 
     first_df = df[df["player_id"] == first_id].copy()
     second_df = df[df["player_id"] == second_id].copy()
@@ -360,14 +421,13 @@ with compare_tab:
         "FG%", "3P%", "FT%", "PER", "WS", "VORP"
     ]
 
-    first_cols = [c for c in stats if c in first_df.columns]
-    second_cols = [c for c in stats if c in second_df.columns]
+    first_cols = [column for column in stats if column in first_df.columns]
+    second_cols = [column for column in stats if column in second_df.columns]
 
     first_name, second_name = st.columns(2)
 
     with first_name:
-        st.markdown("#### Player A")
-        st.caption(f"ID: {first_id}")
+        st.markdown(f"#### {first_df['player_name'].iloc[0]}")
         st.dataframe(
             first_df[first_cols],
             use_container_width=True,
@@ -375,8 +435,7 @@ with compare_tab:
         )
 
     with second_name:
-        st.markdown("#### Player B")
-        st.caption(f"ID: {second_id}")
+        st.markdown(f"#### {second_df['player_name'].iloc[0]}")
         st.dataframe(
             second_df[second_cols],
             use_container_width=True,
@@ -429,4 +488,3 @@ st.markdown(
     '</div>',
     unsafe_allow_html=True
 )
-
