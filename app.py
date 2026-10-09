@@ -424,7 +424,8 @@ with players_tab:
                              "Blocks", "Turnovers"]
                 if f"{stat}PerGame" in season_details.columns
            
-            ] st.dataframe(
+            ] 
+            st.dataframe(
                 season_details[visible_stats],
                 use_container_width=True,
                 hide_index=True
