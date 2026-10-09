@@ -349,15 +349,13 @@ with players_tab:
 
 
 
-    preferred_stats = [
-        # Season and playing time
-        "Season", "Age", "Tm", "GamesPlayed", "G",
-        "Minutes", "MP", "SecondsPlayed",
+        preferred_stats = [
+        "Season", "Age", "Tm",
+        "GamesPlayed", "Minutes", "SecondsPlayed",
 
-        # Traditional production
-        "Points", "PTS", "Rebounds", "TRB",
-        "Assists", "AST", "Steals", "STL",
-        "Blocks", "BLK", "Turnovers", "TOV",
+        # Traditional statistics
+        "Points", "Rebounds", "Assists",
+        "Steals", "Blocks", "Turnovers",
         "PlusMinus",
 
         # Shooting
@@ -365,8 +363,7 @@ with players_tab:
         "FtPoints", "AtRimFGM", "AtRimFGA",
         "ShortMidRangeFGM", "ShortMidRangeFGA",
         "LongMidRangeFGM", "LongMidRangeFGA",
-        "Corner3FGM", "Corner3FGA",
-        "Arc3FGA",
+        "Corner3FGM", "Corner3FGA", "Arc3FGA",
 
         # Passing and shot creation
         "PtsAssisted2s", "PtsUnassisted2s",
@@ -376,7 +373,7 @@ with players_tab:
         # Rebounding
         "OffRebounds", "DefRebounds",
 
-        # Possessions and ball security
+        # Possessions and turnovers
         "OffPoss", "DefPoss", "TotalPoss",
         "LiveBallTurnovers", "BadPassTurnovers",
         "LostBallTurnovers",
