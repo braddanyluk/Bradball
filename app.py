@@ -666,7 +666,10 @@ with lab_tab:
         if column.lower() in excluded_names:
             continue
 
-        if column in duplicate_aliases:
+        if column in {
+            "PTS", "TRB", "AST", "STL", "BLK", "TOV", "MP",
+            "GamesPlayed",
+        }:
             continue
 
         values = pd.to_numeric(df[column], errors="coerce")
