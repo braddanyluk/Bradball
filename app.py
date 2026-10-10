@@ -896,7 +896,7 @@ with lab_tab:
 
             first_stat, second_stat = st.columns(2)
 
-                   available_stats = sorted(
+available_stats = sorted(
                 numeric_data.columns,
                 key=str.lower,
             )
