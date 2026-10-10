@@ -178,7 +178,7 @@ def load_data():
     data["player_name"] = data["player_id"].map(name_lookup)
     data["player_name"] = data["player_name"].fillna("Unknown player")
 
-        # Compatibility aliases for the existing app interface.
+    # Compatibility aliases for the existing app interface.
     column_map = {
         "GamesPlayed": "G",
         "Points": "PTS",
@@ -193,6 +193,7 @@ def load_data():
     for source, target in column_map.items():
         if source in data.columns:
             data[target] = data[source]
+            
     # Calculate per-100 stats using half of total possessions.
     if "TotalPoss" in data.columns:
         total_possessions = pd.to_numeric(
@@ -229,6 +230,7 @@ def load_data():
             data[f"{column}/100"] = (
                 values.div(denominator).mul(100)
             ).where(denominator > 0).round(2)
+            
     return data
 
 
@@ -329,9 +331,9 @@ st.write("")
 # --------------------------------------------------
 
 players_tab, compare_tab, lab_tab = st.tabs([
-    "🏀  Player Explorer",
-    "⚖️  Compare",
-    "🧪  Data Lab",
+    "🏀 Player Explorer",
+    "⚖️ Compare",
+    "🧪 Data Lab",
 ])
 
 # --------------------------------------------------
@@ -385,8 +387,6 @@ with players_tab:
 
     st.markdown("#### Season history")
 
-
-
     preferred_stats = [
         "Season", "Age", "Tm",
         "GamesPlayed", "Minutes", "SecondsPlayed",
@@ -416,7 +416,6 @@ with players_tab:
         "LiveBallTurnovers", "BadPassTurnovers",
         "LostBallTurnovers",
     ]
-    
 
     visible_stats = [
         column for column in preferred_stats
@@ -440,7 +439,7 @@ with players_tab:
 
         # Show the selected season's stats in a readable table.
         if not season_details.empty:
-                       # Calculate per-game averages for this season.
+            # Calculate per-game averages for this season.
             games = pd.to_numeric(
                 season_details["GamesPlayed"], errors="coerce"
             )
@@ -461,14 +460,15 @@ with players_tab:
                 for stat in ["Points", "Rebounds", "Assists", "Steals",
                              "Blocks", "Turnovers"]
                 if f"{stat}PerGame" in season_details.columns
-           
-            ] 
+            ]
+
             st.dataframe(
                 season_details[visible_stats],
                 use_container_width=True,
                 hide_index=True
             )
-                # Searchable grid of individual stat cards.
+
+            # Searchable grid of individual stat cards.
             with st.expander(
                 "🔬 Explore All Available Stats",
                 expanded=False
@@ -495,6 +495,7 @@ with players_tab:
                 raw_data = raw_data[
                     sorted(raw_data.columns, key=str.lower)
                 ]
+                
                 # Remove calculated per-game stats.
                 raw_data = raw_data.drop(
                     columns=[
@@ -522,46 +523,7 @@ with players_tab:
                 else:
                     st.caption(
                         f"Showing {len(raw_data.columns)} statistics"
-                    )
-
-                    stat_columns = st.columns(3)
-
-                    for index, column in enumerate(raw_data.columns):
-                        value = raw_data[column].iloc[0]
-
-                        if pd.isna(value):
-                            display_value = "—"
-                        elif isinstance(value, (int, float)):
-                            display_value = (
-                                f"{value:,.2f}".rstrip("0").rstrip(".")
-                            )
-                        else:
-                            display_value = str(value)
-
-                        with stat_columns[index % 3]:
-                            with st.container(border=True):
-                                st.caption(str(column))
-                                st.markdown(f"### {display_value}")
-
-    else:
-        st.info("Season information is not available for this player.")
-
-    if "Season" in player_df.columns and "PTS" in player_df.columns:
-        st.markdown("#### Scoring across seasons")
-
-        chart_df = player_df[["Season", "PTS"]].copy()
-        chart_df["PTS"] = pd.to_numeric(
-            chart_df["PTS"], errors="coerce"
-        )
-        chart_df = chart_df.dropna(subset=["PTS"])
-
-        if not chart_df.empty:
-            st.line_chart(
-                chart_df.set_index("Season")["PTS"],
-                use_container_width=True
-            )
-
-# --------------------------------------------------
+                        # --------------------------------------------------
 # PLAYER COMPARISON
 # --------------------------------------------------
 
@@ -671,7 +633,8 @@ with lab_tab:
         use_container_width=True,
         hide_index=True
     )
-       # --------------------------------------------------
+    
+    # --------------------------------------------------
     # RELATIONSHIP EXPLORER
     # --------------------------------------------------
 
@@ -682,22 +645,13 @@ with lab_tab:
         "together across player-seasons."
     )
 
-    # Use one canonical name for each duplicated statistic.
-    duplicate_aliases = {
-        "PTS", "TRB", "AST", "STL", "BLK", "TOV", "MP",
-        "GamesPlayed", "Points", "Rebounds", "Assists",
-        "Steals", "Blocks", "Turnovers", "Minutes",
-    }
-
     excluded_names = {
         "player_id", "player_name", "player", "season",
         "age", "year", "rank", "number", "jersey",
         "team", "tm", "gamesplayed", "g",
     }
 
-    # Prefer original descriptive names over compatibility aliases.
     numeric_data = pd.DataFrame(index=df.index)
-    used_names = set()
 
     for column in df.columns:
         if column.lower() in excluded_names:
@@ -896,19 +850,19 @@ with lab_tab:
 
             first_stat, second_stat = st.columns(2)
 
-available_stats = sorted(
+            available_stats = sorted(
                 numeric_data.columns,
                 key=str.lower,
             )
 
-with first_stat:
+            with first_stat:
                 selected_x = st.selectbox(
                     "First statistic",
                     available_stats,
                     key="relationship_x",
                 )
 
-with second_stat:
+            with second_stat:
                 selected_y = st.selectbox(
                     "Second statistic",
                     [
@@ -918,14 +872,14 @@ with second_stat:
                     key="relationship_y",
                 )
 
-pair_data = numeric_data[
+            pair_data = numeric_data[
                 [selected_x, selected_y]
             ].dropna()
 
-x = pair_data[selected_x]
-y = pair_data[selected_y]
+            x = pair_data[selected_x]
+            y = pair_data[selected_y]
 
-ordinary_r = x.corr(y)
+            ordinary_r = x.corr(y)
 
             weighted_r = float("nan")
 
@@ -991,6 +945,7 @@ ordinary_r = x.corr(y)
                 "statistics are also mathematically related. Treat "
                 "these findings as exploratory evidence."
             )
+
 st.markdown(
     '<div class="footer">'
     'BRADBALL &nbsp; / &nbsp; DATA BEFORE ASSUMPTIONS &nbsp; / &nbsp; '
