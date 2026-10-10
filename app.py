@@ -433,7 +433,78 @@ with players_tab:
                 use_container_width=True,
                 hide_index=True
             )
-    
+                # Searchable grid of individual stat cards.
+            with st.expander(
+                "🔬 Explore All Available Stats",
+                expanded=False
+            ):
+                st.write(
+                    "Explore the full statistical profile for this player-season."
+                )
+
+                raw_data = season_details.copy()
+
+                # Remove duplicate compatibility aliases.
+                duplicate_aliases = [
+                    "G", "PTS", "TRB", "AST",
+                    "STL", "BLK", "TOV", "MP"
+                ]
+
+                raw_data = raw_data.drop(
+                    columns=[
+                        col for col in duplicate_aliases
+                        if col in raw_data.columns
+                    ],
+                    errors="ignore"
+                )
+
+                # Remove calculated per-game stats.
+                raw_data = raw_data.drop(
+                    columns=[
+                        col for col in raw_data.columns
+                        if col.endswith("PerGame")
+                    ],
+                    errors="ignore"
+                )
+
+                search_term = st.text_input(
+                    "🔎 Search statistics",
+                    placeholder="Try: turnover, assist, rim, possession...",
+                    key="raw_data_search"
+                )
+
+                if search_term.strip():
+                    matching_columns = [
+                        col for col in raw_data.columns
+                        if search_term.lower() in str(col).lower()
+                    ]
+                    raw_data = raw_data[matching_columns]
+
+                if len(raw_data.columns) == 0:
+                    st.info("No statistics matched that search.")
+                else:
+                    st.caption(
+                        f"Showing {len(raw_data.columns)} statistics"
+                    )
+
+                    stat_columns = st.columns(3)
+
+                    for index, column in enumerate(raw_data.columns):
+                        value = raw_data[column].iloc[0]
+
+                        if pd.isna(value):
+                            display_value = "—"
+                        elif isinstance(value, (int, float)):
+                            display_value = (
+                                f"{value:,.2f}".rstrip("0").rstrip(".")
+                            )
+                        else:
+                            display_value = str(value)
+
+                        with stat_columns[index % 3]:
+                            with st.container(border=True):
+                                st.caption(str(column))
+                                st.markdown(f"### {display_value}")
 
     else:
         st.info("Season information is not available for this player.")
