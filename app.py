@@ -193,7 +193,42 @@ def load_data():
     for source, target in column_map.items():
         if source in data.columns:
             data[target] = data[source]
+    # Calculate per-100 stats using half of total possessions.
+    if "TotalPoss" in data.columns:
+        total_possessions = pd.to_numeric(
+            data["TotalPoss"], errors="coerce"
+        )
+        denominator = total_possessions / 2
 
+        # Columns that describe context or are already rates,
+        # percentages, identifiers, or other non-counting data.
+        excluded_stats = {
+            "Season", "Age", "Tm", "Player", "player_name",
+            "player_id", "PlayerId", "GamesPlayed",
+            "Minutes", "SecondsPlayed", "TotalPoss",
+            "OffPoss", "DefPoss",
+        }
+
+        # Find numeric counting statistics and normalize them.
+        for column in data.columns:
+            if column in excluded_stats or column.endswith("/100"):
+                continue
+
+            if not pd.api.types.is_numeric_dtype(data[column]):
+                continue
+
+            # Don't normalize existing percentages or rates.
+            name_lower = column.lower()
+            if any(term in name_lower for term in [
+                "pct", "percent", "percentage", "rate",
+                "ratio", "share", "usage",
+            ]):
+                continue
+
+            values = pd.to_numeric(data[column], errors="coerce")
+            data[f"{column}/100"] = (
+                values.div(denominator).mul(100)
+            ).where(denominator > 0).round(2)
     return data
 
 
