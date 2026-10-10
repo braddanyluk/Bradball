@@ -901,7 +901,7 @@ available_stats = sorted(
                 key=str.lower,
             )
 
-        with first_stat:
+with first_stat:
                 selected_x = st.selectbox(
                     "First statistic",
                     available_stats,
