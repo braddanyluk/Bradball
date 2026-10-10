@@ -492,7 +492,9 @@ with players_tab:
                     ],
                     errors="ignore"
                 )
-
+                raw_data = raw_data[
+                    sorted(raw_data.columns, key=str.lower)
+                ]
                 # Remove calculated per-game stats.
                 raw_data = raw_data.drop(
                     columns=[
