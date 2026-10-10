@@ -523,7 +523,44 @@ with players_tab:
                 else:
                     st.caption(
                         f"Showing {len(raw_data.columns)} statistics"
-                        # --------------------------------------------------
+                    )
+
+                    stat_columns = st.columns(3)
+
+                    for index, column in enumerate(raw_data.columns):
+                        value = raw_data[column].iloc[0]
+
+                        if pd.isna(value):
+                            display_value = "—"
+                        elif isinstance(value, (int, float)):
+                            display_value = (
+                                f"{value:,.2f}".rstrip("0").rstrip(".")
+                            )
+                        else:
+                            display_value = str(value)
+
+                        with stat_columns[index % 3]:
+                            with st.container(border=True):
+                                st.caption(str(column))
+                                st.markdown(f"### {display_value}")
+
+    else:
+        st.info("Season information is not available for this player.")
+
+    if "Season" in player_df.columns and "PTS" in player_df.columns:
+        st.markdown("#### Scoring across seasons")
+
+        chart_df = player_df[["Season", "PTS"]].copy()
+        chart_df["PTS"] = pd.to_numeric(
+            chart_df["PTS"], errors="coerce"
+        )
+        chart_df = chart_df.dropna(subset=["PTS"])
+
+        if not chart_df.empty:
+            st.line_chart(
+                chart_df.set_index("Season")["PTS"],
+                use_container_width=True
+            )
 # PLAYER COMPARISON
 # --------------------------------------------------
 
