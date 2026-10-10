@@ -918,7 +918,7 @@ with second_stat:
                     key="relationship_y",
                 )
 
-            pair_data = numeric_data[
+pair_data = numeric_data[
                 [selected_x, selected_y]
             ].dropna()
 
