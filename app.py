@@ -922,8 +922,8 @@ pair_data = numeric_data[
                 [selected_x, selected_y]
             ].dropna()
 
-            x = pair_data[selected_x]
-            y = pair_data[selected_y]
+x = pair_data[selected_x]
+y = pair_data[selected_y]
 
             ordinary_r = x.corr(y)
 
