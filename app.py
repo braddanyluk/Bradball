@@ -896,7 +896,10 @@ with lab_tab:
 
             first_stat, second_stat = st.columns(2)
 
-            available_stats = list(numeric_data.columns)
+                   available_stats = sorted(
+                numeric_data.columns,
+                key=str.lower,
+            )
 
             with first_stat:
                 selected_x = st.selectbox(
