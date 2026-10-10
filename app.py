@@ -908,7 +908,7 @@ with first_stat:
                     key="relationship_x",
                 )
 
-            with second_stat:
+with second_stat:
                 selected_y = st.selectbox(
                     "Second statistic",
                     [
