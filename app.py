@@ -925,7 +925,7 @@ pair_data = numeric_data[
 x = pair_data[selected_x]
 y = pair_data[selected_y]
 
-            ordinary_r = x.corr(y)
+ordinary_r = x.corr(y)
 
             weighted_r = float("nan")
 
