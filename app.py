@@ -634,7 +634,323 @@ with lab_tab:
         use_container_width=True,
         hide_index=True
     )
+    # --------------------------------------------------
+    # RELATIONSHIP EXPLORER
+    # --------------------------------------------------
 
+    st.divider()
+
+    st.markdown("#### Relationship Explorer")
+
+    st.write(
+        "Discover which statistical characteristics tend to move "
+        "together across player-seasons."
+    )
+
+    # Find a suitable minutes column for weighting.
+    weight_candidates = [
+        "Minutes",
+        "SecondsPlayed",
+        "MP",
+    ]
+
+    weight_column = next(
+        (column for column in weight_candidates if column in df.columns),
+        None
+    )
+
+    # Columns that identify records rather than basketball skills.
+    excluded_names = {
+        "player_id",
+        "player_name",
+        "player",
+        "season",
+        "age",
+        "year",
+        "rank",
+        "number",
+        "jersey",
+        "team",
+        "tm",
+    }
+
+    # Identify numeric columns with enough usable observations.
+    numeric_columns = []
+
+    for column in df.columns:
+        if column.lower() in excluded_names:
+            continue
+
+        if column == weight_column:
+            continue
+
+        values = pd.to_numeric(df[column], errors="coerce")
+
+        if values.notna().sum() < 30:
+            continue
+
+        if values.nunique(dropna=True) < 2:
+            continue
+
+        numeric_columns.append(column)
+
+    if len(numeric_columns) < 2:
+        st.warning(
+            "Not enough suitable numeric statistics were found "
+            "to calculate relationships."
+        )
+
+    elif weight_column is None:
+        st.warning(
+            "No minutes column was found. Ordinary correlations "
+            "are available, but minutes-weighted correlations "
+            "require a minutes field."
+        )
+
+    else:
+        # Convert the minutes field to numeric values.
+        weights = pd.to_numeric(
+            df[weight_column],
+            errors="coerce"
+        )
+
+        # Weighted Pearson correlation.
+        def weighted_correlation(x, y, w):
+            valid = (
+                x.notna()
+                & y.notna()
+                & w.notna()
+                & (w > 0)
+            )
+
+            x = x[valid].astype(float)
+            y = y[valid].astype(float)
+            w = w[valid].astype(float)
+
+            if len(x) < 3 or w.sum() <= 0:
+                return float("nan")
+
+            mean_x = (w * x).sum() / w.sum()
+            mean_y = (w * y).sum() / w.sum()
+
+            centered_x = x - mean_x
+            centered_y = y - mean_y
+
+            covariance = (
+                w * centered_x * centered_y
+            ).sum() / w.sum()
+
+            variance_x = (
+                w * centered_x.pow(2)
+            ).sum() / w.sum()
+
+            variance_y = (
+                w * centered_y.pow(2)
+            ).sum() / w.sum()
+
+            if variance_x <= 0 or variance_y <= 0:
+                return float("nan")
+
+            return covariance / (
+                variance_x * variance_y
+            ) ** 0.5
+
+        # Calculate every unique pair of statistics.
+        results = []
+
+        for i, stat_a in enumerate(numeric_columns):
+            x = pd.to_numeric(df[stat_a], errors="coerce")
+
+            for stat_b in numeric_columns[i + 1:]:
+                y = pd.to_numeric(df[stat_b], errors="coerce")
+
+                valid = x.notna() & y.notna()
+
+                sample_size = int(valid.sum())
+
+                if sample_size < 30:
+                    continue
+
+                ordinary_r = x[valid].corr(y[valid])
+
+                weighted_r = weighted_correlation(
+                    x,
+                    y,
+                    weights
+                )
+
+                if pd.isna(ordinary_r):
+                    continue
+
+                results.append({
+                    "Statistic A": stat_a,
+                    "Statistic B": stat_b,
+                    "Correlation": ordinary_r,
+                    "Minutes-weighted": weighted_r,
+                    "Player-seasons": sample_size,
+                })
+
+        relationships = pd.DataFrame(results)
+
+        if relationships.empty:
+            st.warning(
+                "No valid statistical relationships could be calculated."
+            )
+
+        else:
+            # Format correlations for display.
+            display_relationships = relationships.copy()
+
+            for column in [
+                "Correlation",
+                "Minutes-weighted",
+            ]:
+                display_relationships[column] = (
+                    display_relationships[column].round(3)
+                )
+
+            st.caption(
+                f"Analyzed {len(numeric_columns)} numeric statistics "
+                f"across {len(df):,} player-season records. "
+                "Each pair uses its own available observations."
+            )
+
+            ranking_choice = st.radio(
+                "Explore relationships",
+                [
+                    "Strongest positive",
+                    "Strongest negative",
+                    "Weakest relationships",
+                ],
+                horizontal=True,
+                key="relationship_ranking"
+            )
+
+            if ranking_choice == "Strongest positive":
+                ranked = relationships.sort_values(
+                    "Correlation",
+                    ascending=False
+                )
+
+            elif ranking_choice == "Strongest negative":
+                ranked = relationships.sort_values(
+                    "Correlation",
+                    ascending=True
+                )
+
+            else:
+                ranked = relationships.assign(
+                    absolute_correlation=lambda data:
+                        data["Correlation"].abs()
+                ).sort_values("absolute_correlation")
+
+            st.dataframe(
+                ranked.head(20)[
+                    [
+                        "Statistic A",
+                        "Statistic B",
+                        "Correlation",
+                        "Minutes-weighted",
+                        "Player-seasons",
+                    ]
+                ].style.format({
+                    "Correlation": "{:+.3f}",
+                    "Minutes-weighted": "{:+.3f}",
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.markdown("#### Investigate a relationship")
+
+            first_stat, second_stat = st.columns(2)
+
+            with first_stat:
+                selected_x = st.selectbox(
+                    "First statistic",
+                    numeric_columns,
+                    index=0,
+                    key="relationship_x"
+                )
+
+            with second_stat:
+                available_y = [
+                    column for column in numeric_columns
+                    if column != selected_x
+                ]
+
+                selected_y = st.selectbox(
+                    "Second statistic",
+                    available_y,
+                    index=0,
+                    key="relationship_y"
+                )
+
+            x = pd.to_numeric(df[selected_x], errors="coerce")
+            y = pd.to_numeric(df[selected_y], errors="coerce")
+
+            valid = x.notna() & y.notna()
+
+            pair_data = pd.DataFrame({
+                "x": x[valid],
+                "y": y[valid],
+            })
+
+            pair_weights = weights[valid]
+
+            ordinary_r = pair_data["x"].corr(pair_data["y"])
+
+            weighted_r = weighted_correlation(
+                x,
+                y,
+                weights
+            )
+
+            result1, result2, result3 = st.columns(3)
+
+            result1.metric(
+                "Ordinary correlation",
+                f"{ordinary_r:+.3f}"
+                if pd.notna(ordinary_r) else "—"
+            )
+
+            result2.metric(
+                "Minutes-weighted correlation",
+                f"{weighted_r:+.3f}"
+                if pd.notna(weighted_r) else "—"
+            )
+
+            result3.metric(
+                "Player-seasons",
+                f"{len(pair_data):,}"
+            )
+
+            st.scatter_chart(
+                pair_data,
+                x="x",
+                y="y",
+                use_container_width=True
+            )
+
+            st.caption(
+                "Correlations range from -1 to +1. Positive values "
+                "indicate that the statistics tend to increase together; "
+                "negative values indicate an inverse relationship. "
+                "Correlation does not establish causation."
+            )
+
+            if weight_column is None:
+                st.info(
+                    "Minutes weighting is unavailable because no "
+                    "minutes column was found."
+                )
+
+            st.info(
+                "Research note: player-seasons are not independent "
+                "people. Players with long careers contribute multiple "
+                "observations, and some statistics may be mathematically "
+                "related. Treat these results as exploratory evidence."
+            )
 st.markdown(
     '<div class="footer">'
     'BRADBALL &nbsp; / &nbsp; DATA BEFORE ASSUMPTIONS &nbsp; / &nbsp; '
