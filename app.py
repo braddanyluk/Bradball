@@ -947,7 +947,6 @@ with lab_tab:
                 "statistics are also mathematically related. Treat "
                 "these findings as exploratory evidence."
             )
-
 st.markdown(
     '<div class="footer">'
     'BRADBALL &nbsp; / &nbsp; DATA BEFORE ASSUMPTIONS &nbsp; / &nbsp; '
