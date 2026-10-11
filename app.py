@@ -191,6 +191,20 @@ def load_data():
         if source in data.columns:
             data[target] = data[source]
 
+    # Recognize common alternate names for the team and season columns.
+    def rename_to(target, candidates):
+        if target in data.columns:
+            return
+        lowered = {c.lower(): c for c in data.columns}
+        for candidate in candidates:
+            if candidate.lower() in lowered:
+                data[target] = data[lowered[candidate.lower()]]
+                return
+
+    rename_to("Tm", ["Team", "TeamAbbreviation", "team_abbreviation",
+                      "TeamAbbr", "Team_Abbreviation", "TeamName", "Squad"])
+    rename_to("Season", ["Year", "SeasonYear", "season_year"])
+
     # Per-100 stats using half of total possessions.
     if "TotalPoss" in data.columns:
         total_possessions = pd.to_numeric(
@@ -1069,10 +1083,30 @@ with team_tab:
     teams = build_team_seasons(df)
 
     if teams.empty:
+        needed = ["Season", "Tm", "FG3A", "AtRimFGA", "OffPoss"]
+        missing = [c for c in needed if c not in df.columns]
+
         st.warning(
-            "Couldn't build team seasons. This needs `Season` and `Tm` "
-            "columns plus shot-zone and possession columns."
+            "Couldn't build team seasons. Missing columns in "
+            f"`player_seasons.csv.gz`: {', '.join(missing) or 'none'}."
         )
+
+        with st.expander("Diagnostic info (paste this to Claude)"):
+            st.write("**Columns in player_seasons.csv.gz:**")
+            st.code(", ".join(map(str, df.columns)))
+
+            try:
+                name_cols = pd.read_csv(NAME_FILE, nrows=3)
+                st.write("**Columns in player_team_seasons.csv:**")
+                st.code(", ".join(map(str, name_cols.columns)))
+                st.write("**First rows of player_team_seasons.csv:**")
+                st.dataframe(name_cols, hide_index=True)
+            except Exception as error:
+                st.write(f"Couldn't read the name file: {error}")
+
+            if "Tm" in df.columns:
+                st.write("**Sample team values:**")
+                st.code(", ".join(map(str, df["Tm"].dropna().unique()[:15])))
     else:
         metric_names = [
             c for c in teams.columns if c not in ("Season", "Tm")
