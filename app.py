@@ -360,6 +360,30 @@ def calculate_relationships(data, weight_values, hide_duplicates):
     return relationships
 
 
+# Era boundaries use the season's starting year (2019-20 counts as 2019).
+ERAS = [
+    ("Before 1996: Early era", 1900, 1995),
+    ("1996-2003: Hand-check era", 1996, 2003),
+    ("2004-2012: Hand-check removed", 2004, 2012),
+    ("2013-2017: Three-point revolution", 2013, 2017),
+    ("2018-present: Modern spacing", 2018, 2100),
+]
+
+
+def season_start_year(season):
+    match = re.search(r"(\d{4})", str(season))
+    return int(match.group(1)) if match else np.nan
+
+
+def era_for_year(year):
+    if pd.isna(year):
+        return None
+    for label, low, high in ERAS:
+        if low <= year <= high:
+            return label
+    return None
+
+
 @st.cache_data(show_spinner="Building team-season table...")
 def build_team_seasons(data):
     """Sum player-seasons into team-seasons and derive team-level metrics.
@@ -380,9 +404,14 @@ def build_team_seasons(data):
 
     sum_columns = [
         "Points", "FG2M", "FG2A", "FG3M", "FG3A", "FtPoints",
-        "AtRimFGM", "AtRimFGA", "ShortMidRangeFGA", "LongMidRangeFGA",
-        "Corner3FGA", "Arc3FGA", "Turnovers", "OffRebounds",
-        "Assists", "OffPoss",
+        "AtRimFGM", "AtRimFGA",
+        "ShortMidRangeFGM", "ShortMidRangeFGA",
+        "LongMidRangeFGM", "LongMidRangeFGA",
+        "Corner3FGM", "Corner3FGA", "Arc3FGM", "Arc3FGA",
+        "PtsAssisted2s", "PtsAssisted3s",
+        "Turnovers", "LiveBallTurnovers",
+        "OffRebounds", "DefRebounds",
+        "Assists", "Steals", "Blocks", "PlusMinus", "OffPoss",
     ]
     sum_columns = [c for c in sum_columns if c in d.columns]
 
@@ -396,6 +425,9 @@ def build_team_seasons(data):
     def has(*cols):
         return all(c in t.columns for c in cols)
 
+    def safe_div(num, den):
+        return (num / den).where(den > 0)
+
     if has("FG2A", "FG3A"):
         t["FGA"] = t["FG2A"] + t["FG3A"]
     if has("OffPoss"):
@@ -403,9 +435,7 @@ def build_team_seasons(data):
 
     out = t[["Season", "Tm"]].copy()
 
-    def safe_div(num, den):
-        return (num / den).where(den > 0)
-
+    # ---- Shot selection ----
     if has("FG3A", "FGA"):
         out["3PA share of shots"] = safe_div(t["FG3A"], t["FGA"])
     if has("AtRimFGA", "FGA"):
@@ -414,24 +444,98 @@ def build_team_seasons(data):
         out["Mid-range share of shots"] = safe_div(
             t["ShortMidRangeFGA"] + t["LongMidRangeFGA"], t["FGA"]
         )
+    if has("LongMidRangeFGA", "FGA"):
+        out["Long mid-range share of shots"] = safe_div(
+            t["LongMidRangeFGA"], t["FGA"]
+        )
     if has("Corner3FGA", "FG3A"):
         out["Corner share of 3PA"] = safe_div(t["Corner3FGA"], t["FG3A"])
+
+    # ---- Shot-making ----
     if has("FG3M", "FG3A"):
         out["3P%"] = safe_div(t["FG3M"], t["FG3A"])
     if has("AtRimFGM", "AtRimFGA"):
         out["Rim FG%"] = safe_div(t["AtRimFGM"], t["AtRimFGA"])
+    if has("FG2M", "FG3M", "FGA"):
+        out["eFG%"] = safe_div(t["FG2M"] + 1.5 * t["FG3M"], t["FGA"])
 
+    # ---- Shot quality vs. shot-making ----
+    # Expected points per shot if the team shot league-average from each
+    # zone that season. Separates "good shots" from "making shots".
+    if "Arc3FGA" in t.columns and "Arc3FGM" not in t.columns:
+        if has("FG3M", "Corner3FGM"):
+            t["Arc3FGM"] = t["FG3M"] - t["Corner3FGM"]
+
+    zones = [
+        ("AtRimFGA", "AtRimFGM", 2),
+        ("ShortMidRangeFGA", "ShortMidRangeFGM", 2),
+        ("LongMidRangeFGA", "LongMidRangeFGM", 2),
+        ("Corner3FGA", "Corner3FGM", 3),
+        ("Arc3FGA", "Arc3FGM", 3),
+    ]
+    if all(has(att, made) for att, made, _ in zones):
+        zone_cols = [c for att, made, _ in zones for c in (att, made)]
+        league = t.groupby("Season")[zone_cols].transform("sum")
+
+        zone_att = sum(t[att] for att, _, _ in zones)
+        expected = sum(
+            t[att] * (value * league[made] / league[att])
+            for att, made, value in zones
+        )
+        actual = sum(t[made] * value for _, made, value in zones)
+
+        out["Shot quality (expected pts/shot)"] = safe_div(expected, zone_att)
+        out["Shot-making vs expected (pts/shot)"] = (
+            safe_div(actual, zone_att) - safe_div(expected, zone_att)
+        )
+
+    # ---- Offense extras ----
+    if has("Points", "FGA"):
+        out["Points per shot (incl. FTs)"] = safe_div(t["Points"], t["FGA"])
+    if has("FtPoints", "FGA"):
+        out["Free-throw points per shot"] = safe_div(t["FtPoints"], t["FGA"])
+    if has("PtsAssisted2s", "PtsAssisted3s", "FG2M", "FG3M"):
+        out["Assisted share of FG points"] = safe_div(
+            t["PtsAssisted2s"] + t["PtsAssisted3s"],
+            2 * t["FG2M"] + 3 * t["FG3M"],
+        )
+    if has("LiveBallTurnovers", "Turnovers"):
+        out["Live-ball share of turnovers"] = safe_div(
+            t["LiveBallTurnovers"], t["Turnovers"]
+        )
+
+    # ---- Per 100 possessions ----
     if has("TeamPoss"):
         per100 = {
             "Points": "Points per 100 poss",
             "Turnovers": "Turnovers per 100 poss",
             "OffRebounds": "Off. rebounds per 100 poss",
+            "DefRebounds": "Def. rebounds per 100 poss",
             "Assists": "Assists per 100 poss",
             "FtPoints": "Free-throw points per 100 poss",
+            "Steals": "Steals per 100 poss",
+            "Blocks": "Blocks per 100 poss",
         }
         for source, label in per100.items():
             if source in t.columns:
                 out[label] = safe_div(t[source], t["TeamPoss"]) * 100
+
+    # ---- Results (approximate) ----
+    # On-court plus-minus summed over players counts each point margin
+    # five times, so divide by 5 to get the team margin.
+    if has("PlusMinus", "TeamPoss"):
+        margin = t["PlusMinus"] / 5
+        out["Net rating (approx.)"] = safe_div(margin, t["TeamPoss"]) * 100
+        if has("Points"):
+            out["Points allowed per 100 poss (approx.)"] = (
+                safe_div(t["Points"] - margin, t["TeamPoss"]) * 100
+            )
+
+    # ---- Era label ----
+    era_map = {
+        s: era_for_year(season_start_year(s)) for s in out["Season"].unique()
+    }
+    out["Era"] = out["Season"].map(era_map)
 
     return out
 
@@ -1109,8 +1213,23 @@ with team_tab:
                 st.code(", ".join(map(str, df["Tm"].dropna().unique()[:15])))
     else:
         metric_names = [
-            c for c in teams.columns if c not in ("Season", "Tm")
+            c for c in teams.columns if c not in ("Season", "Tm", "Era")
         ]
+
+        # ---- Era filter ----
+        present_eras = [
+            label for label, _, _ in ERAS
+            if label in set(teams["Era"].dropna())
+        ]
+
+        selected_eras = st.multiselect(
+            "Eras to include",
+            present_eras,
+            default=present_eras,
+            help="Era boundaries use each season's starting year. "
+                 "Pick one era to see how a relationship looks in that "
+                 "period alone.",
+        )
 
         team_z = st.checkbox(
             "Compare within each season",
@@ -1120,6 +1239,8 @@ with team_tab:
                  "own season, which removes era trends.",
         )
 
+        # Z-scores are always computed within a season, so filtering by
+        # era afterward doesn't change them.
         if team_z:
             team_values = within_group_z(
                 teams[metric_names], teams["Season"]
@@ -1127,49 +1248,107 @@ with team_tab:
         else:
             team_values = teams[metric_names].copy()
 
-        tx, ty = st.columns(2)
+        era_mask = teams["Era"].isin(selected_eras)
 
-        default_x = (
-            metric_names.index("3PA share of shots")
-            if "3PA share of shots" in metric_names else 0
-        )
+        if not era_mask.any():
+            st.info("Select at least one era.")
+        else:
+            tx, ty = st.columns(2)
 
-        with tx:
-            team_x = st.selectbox(
-                "First statistic",
-                metric_names,
-                index=default_x,
-                key="team_x",
+            default_x = (
+                metric_names.index("3PA share of shots")
+                if "3PA share of shots" in metric_names else 0
             )
 
-        y_options = [m for m in metric_names if m != team_x]
-        default_y = (
-            y_options.index("Rim share of shots")
-            if "Rim share of shots" in y_options else 0
-        )
+            with tx:
+                team_x = st.selectbox(
+                    "First statistic",
+                    metric_names,
+                    index=default_x,
+                    key="team_x",
+                )
 
-        with ty:
-            team_y = st.selectbox(
-                "Second statistic",
-                y_options,
-                index=default_y,
-                key="team_y",
+            y_options = [m for m in metric_names if m != team_x]
+            default_y = (
+                y_options.index("Rim share of shots")
+                if "Rim share of shots" in y_options else 0
             )
 
-        render_relationship(team_values, team_x, team_y, unit="team-seasons")
+            with ty:
+                team_y = st.selectbox(
+                    "Second statistic",
+                    y_options,
+                    index=default_y,
+                    key="team_y",
+                )
 
-        with st.expander("See the team-season table"):
-            st.dataframe(
-                teams.round(3),
-                use_container_width=True,
-                hide_index=True,
+            render_relationship(
+                team_values[era_mask],
+                team_x,
+                team_y,
+                unit="team-seasons",
             )
 
-        st.caption(
-            "Team possessions are estimated from player data (the sum of "
-            "each player's offensive possessions divided by 5), so "
-            "per-100 numbers are approximate."
-        )
+            # ---- Same relationship, era by era ----
+            st.markdown("#### Does it change by era?")
+
+            era_rows = []
+            for label in present_eras:
+                rows = (teams["Era"] == label)
+                pair = team_values.loc[rows, [team_x, team_y]].dropna()
+                if len(pair) >= 10:
+                    era_rows.append({
+                        "Era": label,
+                        "Correlation": pair[team_x].corr(pair[team_y]),
+                        "Team-seasons": len(pair),
+                    })
+
+            if era_rows:
+                st.dataframe(
+                    pd.DataFrame(era_rows).style.format(
+                        {"Correlation": "{:+.3f}"}
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.caption(
+                    "Eras with fewer than 10 team-seasons are left out. "
+                    "Small eras swing a lot, so look for patterns that "
+                    "hold across several eras."
+                )
+            else:
+                st.caption("Not enough team-seasons per era to compare.")
+
+            # ---- What moves with the first statistic ----
+            with st.expander(f"What correlates with “{team_x}”?"):
+                subset = team_values.loc[era_mask, metric_names]
+                related = (
+                    subset.corr(min_periods=10)[team_x]
+                    .drop(team_x)
+                    .dropna()
+                    .sort_values(ascending=False)
+                )
+                related_table = related.reset_index()
+                related_table.columns = ["Statistic", "Correlation"]
+
+                st.dataframe(
+                    related_table.style.format({"Correlation": "{:+.3f}"}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            with st.expander("See the team-season table"):
+                st.dataframe(
+                    teams[era_mask].round(3),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            st.caption(
+                "Team possessions are estimated from player data (the sum "
+                "of each player's offensive possessions divided by 5), so "
+                "per-100 and net rating numbers are approximate."
+            )
 
 st.markdown(
     '<div class="footer">'
