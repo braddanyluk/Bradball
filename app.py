@@ -642,41 +642,8 @@ with lab_tab:
         unsafe_allow_html=True
     )
 
-    st.header("Inspect the evidence")
+    st.header("Relationship Explorer")
 
-    st.write(
-        "Check what the database contains before drawing conclusions."
-    )
-
-    st.markdown("#### Database structure")
-
-    structure1, structure2 = st.columns(2)
-
-    structure1.metric("Rows", f"{len(df):,}")
-    structure2.metric("Columns", f"{len(df.columns):,}")
-
-    st.markdown("#### Available variables")
-
-    st.dataframe(
-        pd.DataFrame({"Column": df.columns.astype(str)}),
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.markdown("#### Sample records")
-
-    st.dataframe(
-        df.head(20),
-        use_container_width=True,
-        hide_index=True
-    )
-    
-    # --------------------------------------------------
-    # RELATIONSHIP EXPLORER
-    # --------------------------------------------------
-
-    st.divider()
-    st.markdown("#### Relationship Explorer")
     st.write(
         "Discover which statistical characteristics tend to move "
         "together across player-seasons."
@@ -726,16 +693,12 @@ with lab_tab:
 
     @st.cache_data(show_spinner="Calculating statistical relationships...")
     def calculate_relationships(data, weight_values=None):
-        # Batch-calculate ordinary Pearson correlations.
         correlations = data.corr(min_periods=30)
 
-        # Count observations for each pair.
         valid = data.notna().astype("int32")
         sample_sizes = valid.T.dot(valid)
 
-        # Build a compact list of unique pairs.
         results = []
-
         columns = list(data.columns)
 
         for i, stat_a in enumerate(columns):
@@ -762,7 +725,6 @@ with lab_tab:
         if relationships.empty:
             return relationships
 
-        # Minutes-weight the strongest ordinary relationships first.
         relationships["Minutes-weighted"] = float("nan")
 
         if weight_values is not None:
@@ -770,8 +732,6 @@ with lab_tab:
                 weight_values, errors="coerce"
             )
 
-            # Calculate weighted correlations for the 200 pairs
-            # with the strongest absolute ordinary correlations.
             candidates = relationships.assign(
                 abs_r=relationships["Correlation"].abs()
             ).nlargest(200, "abs_r")
@@ -779,8 +739,11 @@ with lab_tab:
             weighted_results = {}
 
             for row in candidates.itertuples(index=False):
-                a = data[row[0]]
-                b = data[row[1]]
+                stat_a = row[0]
+                stat_b = row[1]
+
+                a = data[stat_a]
+                b = data[stat_b]
 
                 valid_pair = (
                     a.notna()
@@ -807,12 +770,13 @@ with lab_tab:
                 var_y = (w * dy.pow(2)).sum() / w.sum()
 
                 if var_x > 0 and var_y > 0:
-                    weighted_results[(row[0], row[1])] = (
+                    weighted_results[(stat_a, stat_b)] = (
                         cov / (var_x * var_y) ** 0.5
                     )
 
             for idx, row in candidates.iterrows():
                 key = (row["Statistic A"], row["Statistic B"])
+
                 if key in weighted_results:
                     relationships.loc[idx, "Minutes-weighted"] = (
                         weighted_results[key]
@@ -857,10 +821,12 @@ with lab_tab:
                 ranked = relationships.sort_values(
                     "Correlation", ascending=False
                 )
+
             elif ranking_choice == "Strongest negative":
                 ranked = relationships.sort_values(
                     "Correlation", ascending=True
                 )
+
             else:
                 ranked = relationships.assign(
                     abs_r=relationships["Correlation"].abs()
@@ -885,12 +851,12 @@ with lab_tab:
 
             st.markdown("#### Investigate a relationship")
 
-            first_stat, second_stat = st.columns(2)
-
             available_stats = sorted(
                 numeric_data.columns,
                 key=str.lower,
             )
+
+            first_stat, second_stat = st.columns(2)
 
             with first_stat:
                 selected_x = st.selectbox(
@@ -917,7 +883,6 @@ with lab_tab:
             y = pair_data[selected_y]
 
             ordinary_r = x.corr(y)
-
             weighted_r = float("nan")
 
             if weights is not None:
