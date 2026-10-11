@@ -1,5 +1,8 @@
-import streamlit as st
+import re
+
+import numpy as np
 import pandas as pd
+import streamlit as st
 from pathlib import Path
 
 # --------------------------------------------------
@@ -27,7 +30,6 @@ st.markdown("""
         color: #FFFFFF;
     }
 
-    /* Improve text contrast throughout the app */
     .stApp p,
     .stApp span,
     .stApp label,
@@ -39,11 +41,11 @@ st.markdown("""
     }
 
     [data-testid="stHeader"] {
-    background-color: #101318;
-    position: sticky;
-    top: 0;
-    z-index: 999;
-}
+        background-color: #101318;
+        position: sticky;
+        top: 0;
+        z-index: 999;
+    }
 
     [data-testid="stSidebar"] {
         background-color: #171B22;
@@ -158,27 +160,22 @@ def load_data():
 
     names = pd.read_csv(NAME_FILE, low_memory=False)
 
-    # Make player IDs consistent between the two files.
     data["player_id"] = data["player_id"].astype("string").str.strip()
     names["player_id"] = names["player_id"].astype("string").str.strip()
 
-    # Clean the name mapping.
     names = names.dropna(subset=["player_id", "player"])
 
     names["player"] = names["player"].astype(str).str.strip()
     names = names[names["player"] != ""]
 
-    # Each player ID should map to one display name.
     name_lookup = (
         names.drop_duplicates("player_id")
         .set_index("player_id")["player"]
     )
 
-    # Add names to every player-season record.
     data["player_name"] = data["player_id"].map(name_lookup)
     data["player_name"] = data["player_name"].fillna("Unknown player")
 
-    # Compatibility aliases for the existing app interface.
     column_map = {
         "GamesPlayed": "G",
         "Points": "PTS",
@@ -193,16 +190,14 @@ def load_data():
     for source, target in column_map.items():
         if source in data.columns:
             data[target] = data[source]
-            
-    # Calculate per-100 stats using half of total possessions.
+
+    # Per-100 stats using half of total possessions.
     if "TotalPoss" in data.columns:
         total_possessions = pd.to_numeric(
             data["TotalPoss"], errors="coerce"
         )
         denominator = total_possessions / 2
 
-        # Columns that describe context or are already rates,
-        # percentages, identifiers, or other non-counting data.
         excluded_stats = {
             "Season", "Age", "Tm", "Player", "player_name",
             "player_id", "PlayerId", "GamesPlayed",
@@ -210,7 +205,6 @@ def load_data():
             "OffPoss", "DefPoss",
         }
 
-        # Find numeric counting statistics and normalize them.
         for column in data.columns:
             if column in excluded_stats or column.endswith("/100"):
                 continue
@@ -218,7 +212,6 @@ def load_data():
             if not pd.api.types.is_numeric_dtype(data[column]):
                 continue
 
-            # Don't normalize existing percentages or rates.
             name_lower = column.lower()
             if any(term in name_lower for term in [
                 "pct", "percent", "percentage", "rate",
@@ -230,8 +223,235 @@ def load_data():
             data[f"{column}/100"] = (
                 values.div(denominator).mul(100)
             ).where(denominator > 0).round(2)
-            
+
     return data
+
+
+# --------------------------------------------------
+# ANALYSIS HELPERS
+# --------------------------------------------------
+
+def weighted_corr(x, y, w):
+    """Weighted Pearson correlation. Returns NaN if undefined."""
+    x = pd.to_numeric(x, errors="coerce")
+    y = pd.to_numeric(y, errors="coerce")
+    w = pd.to_numeric(w, errors="coerce")
+
+    ok = x.notna() & y.notna() & w.notna() & (w > 0)
+    x, y, w = x[ok].astype(float), y[ok].astype(float), w[ok].astype(float)
+
+    if len(x) < 3 or w.sum() <= 0:
+        return float("nan")
+
+    mx = (w * x).sum() / w.sum()
+    my = (w * y).sum() / w.sum()
+    dx, dy = x - mx, y - my
+
+    vx = (w * dx.pow(2)).sum() / w.sum()
+    vy = (w * dy.pow(2)).sum() / w.sum()
+
+    if vx <= 0 or vy <= 0:
+        return float("nan")
+
+    return float(((w * dx * dy).sum() / w.sum()) / (vx * vy) ** 0.5)
+
+
+def within_group_z(data, groups):
+    """Z-score every column within each group (e.g. each season).
+
+    This stops league-wide trends (like the rise of the three-pointer)
+    from creating fake relationships across eras.
+    """
+    grouped = data.groupby(groups)
+    mean = grouped.transform("mean")
+    std = grouped.transform("std")
+    z = (data - mean) / std
+    return z.replace([np.inf, -np.inf], np.nan)
+
+
+def is_rate_column(name):
+    """True for per-100 stats, percentages, shares and other rates."""
+    lowered = name.lower()
+    return (
+        name.endswith("/100")
+        or "%" in name
+        or any(term in lowered for term in [
+            "pct", "percent", "rate", "ratio", "share", "usage",
+        ])
+    )
+
+
+def stat_stem(name):
+    """Rough 'family' of a stat so FG3M and FG3A count as the same thing."""
+    s = name.replace("/100", "").lower()
+    s = re.sub(r"(?<=\d)[ma]$|fg[ma]$", "", s)
+    for token in ("made", "attempts", "pct"):
+        s = s.replace(token, "")
+    return s.strip("_ ")
+
+
+def is_near_duplicate(a, b):
+    """Hide pairs like FG3M vs FG3A that are related by definition."""
+    sa, sb = stat_stem(a), stat_stem(b)
+    if not sa or not sb:
+        return False
+    return sa == sb or sa.startswith(sb) or sb.startswith(sa)
+
+
+@st.cache_data(show_spinner="Calculating statistical relationships...")
+def calculate_relationships(data, weight_values, hide_duplicates):
+    corr = data.corr(min_periods=30)
+
+    valid = data.notna().astype("int32")
+    sample_sizes = valid.T.dot(valid)
+
+    columns = np.array(data.columns)
+    rows, cols = np.triu_indices(len(columns), k=1)
+
+    relationships = pd.DataFrame({
+        "Statistic A": columns[rows],
+        "Statistic B": columns[cols],
+        "Correlation": corr.values[rows, cols],
+        "Player-seasons": sample_sizes.values[rows, cols],
+    })
+
+    relationships = relationships.dropna(subset=["Correlation"])
+    relationships = relationships[relationships["Player-seasons"] >= 30]
+
+    if hide_duplicates and not relationships.empty:
+        keep = [
+            not is_near_duplicate(a, b)
+            for a, b in zip(
+                relationships["Statistic A"],
+                relationships["Statistic B"],
+            )
+        ]
+        relationships = relationships[keep]
+
+    relationships = relationships.reset_index(drop=True)
+    relationships["Minutes-weighted"] = np.nan
+
+    if weight_values is not None and not relationships.empty:
+        candidates = relationships.assign(
+            abs_r=relationships["Correlation"].abs()
+        ).nlargest(200, "abs_r")
+
+        for idx, row in candidates.iterrows():
+            relationships.loc[idx, "Minutes-weighted"] = weighted_corr(
+                data[row["Statistic A"]],
+                data[row["Statistic B"]],
+                weight_values,
+            )
+
+    return relationships
+
+
+@st.cache_data(show_spinner="Building team-season table...")
+def build_team_seasons(data):
+    """Sum player-seasons into team-seasons and derive team-level metrics.
+
+    Team possessions are approximated as (sum of every player's offensive
+    possessions) / 5, since five players are on the floor at once.
+    """
+    if "Tm" not in data.columns or "Season" not in data.columns:
+        return pd.DataFrame()
+
+    d = data.copy()
+
+    # Drop combined rows for traded players so nobody is double counted.
+    is_combined = (
+        d["Tm"].astype(str).str.upper().str.match(r"^(TOT|\dTM)$")
+    )
+    d = d[~is_combined]
+
+    sum_columns = [
+        "Points", "FG2M", "FG2A", "FG3M", "FG3A", "FtPoints",
+        "AtRimFGM", "AtRimFGA", "ShortMidRangeFGA", "LongMidRangeFGA",
+        "Corner3FGA", "Arc3FGA", "Turnovers", "OffRebounds",
+        "Assists", "OffPoss",
+    ]
+    sum_columns = [c for c in sum_columns if c in d.columns]
+
+    if not sum_columns:
+        return pd.DataFrame()
+
+    d[sum_columns] = d[sum_columns].apply(pd.to_numeric, errors="coerce")
+
+    t = d.groupby(["Season", "Tm"], as_index=False)[sum_columns].sum()
+
+    def has(*cols):
+        return all(c in t.columns for c in cols)
+
+    if has("FG2A", "FG3A"):
+        t["FGA"] = t["FG2A"] + t["FG3A"]
+    if has("OffPoss"):
+        t["TeamPoss"] = t["OffPoss"] / 5
+
+    out = t[["Season", "Tm"]].copy()
+
+    def safe_div(num, den):
+        return (num / den).where(den > 0)
+
+    if has("FG3A", "FGA"):
+        out["3PA share of shots"] = safe_div(t["FG3A"], t["FGA"])
+    if has("AtRimFGA", "FGA"):
+        out["Rim share of shots"] = safe_div(t["AtRimFGA"], t["FGA"])
+    if has("ShortMidRangeFGA", "LongMidRangeFGA", "FGA"):
+        out["Mid-range share of shots"] = safe_div(
+            t["ShortMidRangeFGA"] + t["LongMidRangeFGA"], t["FGA"]
+        )
+    if has("Corner3FGA", "FG3A"):
+        out["Corner share of 3PA"] = safe_div(t["Corner3FGA"], t["FG3A"])
+    if has("FG3M", "FG3A"):
+        out["3P%"] = safe_div(t["FG3M"], t["FG3A"])
+    if has("AtRimFGM", "AtRimFGA"):
+        out["Rim FG%"] = safe_div(t["AtRimFGM"], t["AtRimFGA"])
+
+    if has("TeamPoss"):
+        per100 = {
+            "Points": "Points per 100 poss",
+            "Turnovers": "Turnovers per 100 poss",
+            "OffRebounds": "Off. rebounds per 100 poss",
+            "Assists": "Assists per 100 poss",
+            "FtPoints": "Free-throw points per 100 poss",
+        }
+        for source, label in per100.items():
+            if source in t.columns:
+                out[label] = safe_div(t[source], t["TeamPoss"]) * 100
+
+    return out
+
+
+def render_relationship(frame, x_col, y_col, weights=None, unit="rows"):
+    """Metrics + scatterplot + caveat for any two columns of `frame`."""
+    pair = frame[[x_col, y_col]].dropna()
+
+    x, y = pair[x_col], pair[y_col]
+    ordinary_r = x.corr(y)
+
+    weighted_r = float("nan")
+    if weights is not None:
+        weighted_r = weighted_corr(x, y, weights.loc[pair.index])
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric(
+        "Correlation",
+        f"{ordinary_r:+.3f}" if pd.notna(ordinary_r) else "—",
+    )
+    if weights is not None:
+        c2.metric(
+            "Minutes-weighted correlation",
+            f"{weighted_r:+.3f}" if pd.notna(weighted_r) else "—",
+        )
+    c3.metric("Sample size", f"{len(pair):,} {unit}")
+
+    st.scatter_chart(pair, x=x_col, y=y_col, use_container_width=True)
+
+    st.caption(
+        "Correlations range from -1 to +1. Positive means the statistics "
+        "tend to rise together; negative means an inverse relationship. "
+        "A relationship is not proof of cause."
+    )
 
 
 # --------------------------------------------------
@@ -288,7 +508,6 @@ if not all(column in df.columns for column in required_columns):
     st.error("The database is missing a required player ID or name column.")
     st.stop()
 
-# One display label per player ID.
 player_lookup = (
     df[["player_id", "player_name"]]
     .dropna(subset=["player_id"])
@@ -330,10 +549,11 @@ st.write("")
 # NAVIGATION
 # --------------------------------------------------
 
-players_tab, compare_tab, lab_tab = st.tabs([
+players_tab, compare_tab, lab_tab, team_tab = st.tabs([
     "🏀 Player Explorer",
     "⚖️ Compare",
     "🧪 Data Lab",
+    "🏟️ Team Lab",
 ])
 
 # --------------------------------------------------
@@ -391,27 +611,22 @@ with players_tab:
         "Season", "Age", "Tm",
         "GamesPlayed", "Minutes", "SecondsPlayed",
 
-        # Traditional statistics
         "Points", "Rebounds", "Assists",
         "Steals", "Blocks", "Turnovers",
         "PlusMinus",
 
-        # Shooting
         "FG2M", "FG2A", "FG3M", "FG3A",
         "FtPoints", "AtRimFGM", "AtRimFGA",
         "ShortMidRangeFGM", "ShortMidRangeFGA",
         "LongMidRangeFGM", "LongMidRangeFGA",
         "Corner3FGM", "Corner3FGA", "Arc3FGA",
 
-        # Passing and shot creation
         "PtsAssisted2s", "PtsUnassisted2s",
         "PtsAssisted3s", "PtsUnassisted3s",
         "TwoPtAssists", "ThreePtAssists",
 
-        # Rebounding
         "OffRebounds", "DefRebounds",
 
-        # Possessions and turnovers
         "OffPoss", "DefPoss", "TotalPoss",
         "LiveBallTurnovers", "BadPassTurnovers",
         "LostBallTurnovers",
@@ -437,9 +652,7 @@ with players_tab:
 
         st.markdown(f"### {selected_season} — Season Statistics")
 
-        # Show the selected season's stats in a readable table.
         if not season_details.empty:
-            # Calculate per-game averages for this season.
             games = pd.to_numeric(
                 season_details["GamesPlayed"], errors="coerce"
             )
@@ -468,7 +681,6 @@ with players_tab:
                 hide_index=True
             )
 
-            # Searchable grid of individual stat cards.
             with st.expander(
                 "🔬 Explore All Available Stats",
                 expanded=False
@@ -479,7 +691,6 @@ with players_tab:
 
                 raw_data = season_details.copy()
 
-                # Remove duplicate compatibility aliases.
                 duplicate_aliases = [
                     "G", "PTS", "TRB", "AST",
                     "STL", "BLK", "TOV", "MP"
@@ -495,8 +706,7 @@ with players_tab:
                 raw_data = raw_data[
                     sorted(raw_data.columns, key=str.lower)
                 ]
-                
-                # Remove calculated per-game stats.
+
                 raw_data = raw_data.drop(
                     columns=[
                         col for col in raw_data.columns
@@ -561,6 +771,8 @@ with players_tab:
                 chart_df.set_index("Season")["PTS"],
                 use_container_width=True
             )
+
+# --------------------------------------------------
 # PLAYER COMPARISON
 # --------------------------------------------------
 
@@ -633,7 +845,7 @@ with compare_tab:
         )
 
 # --------------------------------------------------
-# DATA LAB
+# DATA LAB (player-season relationships)
 # --------------------------------------------------
 
 with lab_tab:
@@ -649,150 +861,100 @@ with lab_tab:
         "together across player-seasons."
     )
 
+    # ---- Controls ----
+    f1, f2, f3, f4 = st.columns(4)
+
+    with f1:
+        rates_only = st.checkbox(
+            "Rates only (per-100, %, shares)",
+            value=True,
+            help="Raw totals mostly measure playing time, so they "
+                 "correlate with each other for boring reasons.",
+        )
+    with f2:
+        within_season = st.checkbox(
+            "Compare within each season",
+            value=True,
+            help="Converts each stat to a z-score inside its own season, "
+                 "so league-wide trends don't create fake relationships.",
+        )
+    with f3:
+        hide_duplicates = st.checkbox(
+            "Hide near-duplicate pairs",
+            value=True,
+            help="Hides pairs like FG3M vs FG3A that are linked by definition.",
+        )
+    with f4:
+        min_minutes = st.slider(
+            "Minimum minutes",
+            min_value=0,
+            max_value=2000,
+            value=300,
+            step=50,
+            help="Set to 0 to include everyone.",
+        )
+
+    # ---- Minutes column (for filter and weighting) ----
+    if "Minutes" in df.columns:
+        minutes = pd.to_numeric(df["Minutes"], errors="coerce")
+    elif "SecondsPlayed" in df.columns:
+        minutes = pd.to_numeric(df["SecondsPlayed"], errors="coerce") / 60
+    else:
+        minutes = None
+
+    if minutes is not None:
+        lab_mask = minutes.fillna(0) >= min_minutes
+    else:
+        lab_mask = pd.Series(True, index=df.index)
+
+    lab_df = df[lab_mask]
+    lab_weights = minutes[lab_mask] if minutes is not None else None
+
+    # ---- Choose columns ----
     excluded_names = {
         "player_id", "player_name", "player", "season",
         "age", "year", "rank", "number", "jersey",
         "team", "tm", "gamesplayed", "g",
+        "minutes", "secondsplayed", "mp",
+        "totalposs", "offposs", "defposs",
+    }
+    alias_columns = {
+        "PTS", "TRB", "AST", "STL", "BLK", "TOV", "MP", "G",
     }
 
-    numeric_data = pd.DataFrame(index=df.index)
+    numeric_data = pd.DataFrame(index=lab_df.index)
 
-    for column in df.columns:
-        if column.lower() in excluded_names:
+    for column in lab_df.columns:
+        if column.lower() in excluded_names or column in alias_columns:
+            continue
+        if column.endswith("PerGame"):
+            continue
+        if rates_only and not is_rate_column(column):
             continue
 
-        if column in {
-            "PTS", "TRB", "AST", "STL", "BLK", "TOV", "MP",
-            "GamesPlayed",
-        }:
-            continue
-
-        values = pd.to_numeric(df[column], errors="coerce")
+        values = pd.to_numeric(lab_df[column], errors="coerce")
 
         if values.notna().sum() < 30:
             continue
-
         if values.nunique(dropna=True) < 2:
             continue
 
         numeric_data[column] = values
 
-    # Find the minutes column for weighting.
-    weight_column = next(
-        (
-            col for col in ["Minutes", "MP", "SecondsPlayed"]
-            if col in df.columns
-        ),
-        None,
-    )
+    if within_season and "Season" in lab_df.columns and len(numeric_data.columns):
+        numeric_data = within_group_z(numeric_data, lab_df["Season"])
 
-    if weight_column is None:
-        weights = None
-    else:
-        weights = pd.to_numeric(df[weight_column], errors="coerce")
-
-    @st.cache_data(show_spinner="Calculating statistical relationships...")
-    def calculate_relationships(data, weight_values=None):
-        correlations = data.corr(min_periods=30)
-
-        valid = data.notna().astype("int32")
-        sample_sizes = valid.T.dot(valid)
-
-        results = []
-        columns = list(data.columns)
-
-        for i, stat_a in enumerate(columns):
-            for stat_b in columns[i + 1:]:
-                n = int(sample_sizes.loc[stat_a, stat_b])
-
-                if n < 30:
-                    continue
-
-                r = correlations.loc[stat_a, stat_b]
-
-                if pd.isna(r):
-                    continue
-
-                results.append({
-                    "Statistic A": stat_a,
-                    "Statistic B": stat_b,
-                    "Correlation": float(r),
-                    "Player-seasons": n,
-                })
-
-        relationships = pd.DataFrame(results)
-
-        if relationships.empty:
-            return relationships
-
-        relationships["Minutes-weighted"] = float("nan")
-
-        if weight_values is not None:
-            weights_numeric = pd.to_numeric(
-                weight_values, errors="coerce"
-            )
-
-            candidates = relationships.assign(
-                abs_r=relationships["Correlation"].abs()
-            ).nlargest(200, "abs_r")
-
-            weighted_results = {}
-
-            for row in candidates.itertuples(index=False):
-                stat_a = row[0]
-                stat_b = row[1]
-
-                a = data[stat_a]
-                b = data[stat_b]
-
-                valid_pair = (
-                    a.notna()
-                    & b.notna()
-                    & weights_numeric.notna()
-                    & (weights_numeric > 0)
-                )
-
-                x = a[valid_pair].astype(float)
-                y = b[valid_pair].astype(float)
-                w = weights_numeric[valid_pair].astype(float)
-
-                if len(x) < 30 or w.sum() <= 0:
-                    continue
-
-                mean_x = (w * x).sum() / w.sum()
-                mean_y = (w * y).sum() / w.sum()
-
-                dx = x - mean_x
-                dy = y - mean_y
-
-                cov = (w * dx * dy).sum() / w.sum()
-                var_x = (w * dx.pow(2)).sum() / w.sum()
-                var_y = (w * dy.pow(2)).sum() / w.sum()
-
-                if var_x > 0 and var_y > 0:
-                    weighted_results[(stat_a, stat_b)] = (
-                        cov / (var_x * var_y) ** 0.5
-                    )
-
-            for idx, row in candidates.iterrows():
-                key = (row["Statistic A"], row["Statistic B"])
-
-                if key in weighted_results:
-                    relationships.loc[idx, "Minutes-weighted"] = (
-                        weighted_results[key]
-                    )
-
-        return relationships
-
-    if len(numeric_data.columns) < 2:
+    if len(numeric_data.columns) < 2 or len(numeric_data) < 30:
         st.warning(
-            "Not enough suitable numeric statistics were found."
+            "Not enough data with these settings. Try lowering the "
+            "minimum minutes or turning off 'Rates only'."
         )
 
     else:
         relationships = calculate_relationships(
             numeric_data,
-            weights,
+            lab_weights,
+            hide_duplicates,
         )
 
         if relationships.empty:
@@ -800,10 +962,10 @@ with lab_tab:
 
         else:
             st.caption(
-                f"Analyzed {len(numeric_data.columns)} statistics "
-                f"across {len(df):,} player-season records. "
-                "Minutes-weighted results are calculated for the "
-                "200 strongest ordinary relationships."
+                f"Analyzed {len(numeric_data.columns)} statistics across "
+                f"{len(numeric_data):,} player-seasons. Minutes-weighted "
+                "results are calculated for the 200 strongest ordinary "
+                "relationships."
             )
 
             ranking_choice = st.radio(
@@ -821,12 +983,10 @@ with lab_tab:
                 ranked = relationships.sort_values(
                     "Correlation", ascending=False
                 )
-
             elif ranking_choice == "Strongest negative":
                 ranked = relationships.sort_values(
                     "Correlation", ascending=True
                 )
-
             else:
                 ranked = relationships.assign(
                     abs_r=relationships["Correlation"].abs()
@@ -868,85 +1028,115 @@ with lab_tab:
             with second_stat:
                 selected_y = st.selectbox(
                     "Second statistic",
-                    [
-                        col for col in available_stats
-                        if col != selected_x
-                    ],
+                    [col for col in available_stats if col != selected_x],
                     key="relationship_y",
                 )
 
-            pair_data = numeric_data[
-                [selected_x, selected_y]
-            ].dropna()
-
-            x = pair_data[selected_x]
-            y = pair_data[selected_y]
-
-            ordinary_r = x.corr(y)
-            weighted_r = float("nan")
-
-            if weights is not None:
-                w = weights.loc[pair_data.index]
-                valid = w.notna() & (w > 0)
-
-                xw = x[valid]
-                yw = y[valid]
-                ww = w[valid]
-
-                if len(xw) >= 3 and ww.sum() > 0:
-                    mx = (ww * xw).sum() / ww.sum()
-                    my = (ww * yw).sum() / ww.sum()
-
-                    dx = xw - mx
-                    dy = yw - my
-
-                    vx = (ww * dx.pow(2)).sum() / ww.sum()
-                    vy = (ww * dy.pow(2)).sum() / ww.sum()
-
-                    if vx > 0 and vy > 0:
-                        weighted_r = (
-                            (ww * dx * dy).sum() / ww.sum()
-                        ) / (vx * vy) ** 0.5
-
-            result1, result2, result3 = st.columns(3)
-
-            result1.metric(
-                "Ordinary correlation",
-                f"{ordinary_r:+.3f}"
-                if pd.notna(ordinary_r) else "—",
-            )
-
-            result2.metric(
-                "Minutes-weighted correlation",
-                f"{weighted_r:+.3f}"
-                if pd.notna(weighted_r) else "—",
-            )
-
-            result3.metric(
-                "Player-seasons",
-                f"{len(pair_data):,}",
-            )
-
-            st.scatter_chart(
-                pair_data,
-                x=selected_x,
-                y=selected_y,
-                use_container_width=True,
-            )
-
-            st.caption(
-                "Correlations range from -1 to +1. Positive values "
-                "indicate that statistics tend to increase together; "
-                "negative values indicate an inverse relationship. "
-                "Correlation does not establish causation."
+            render_relationship(
+                numeric_data,
+                selected_x,
+                selected_y,
+                weights=lab_weights,
+                unit="player-seasons",
             )
 
             st.info(
-                "Research note: players contribute multiple seasons, "
-                "so observations are not independent people. Some "
-                "statistics are also mathematically related. Treat "
-                "these findings as exploratory evidence."
+                "Research note: players contribute multiple seasons, so "
+                "observations are not independent. Player-level "
+                "relationships also reflect position (guards shoot threes, "
+                "centers shoot at the rim). For questions about how a "
+                "team plays, use the Team Lab."
             )
+
+# --------------------------------------------------
+# TEAM LAB (team-season relationships)
+# --------------------------------------------------
+
+with team_tab:
+    st.markdown(
+        '<div class="section-label">04 / Team Lab</div>',
+        unsafe_allow_html=True
+    )
+
+    st.header("How teams play")
+
+    st.write(
+        "Each dot is one team in one season. Use this for questions about "
+        "style, like whether shooting more threes goes with more shots at "
+        "the rim."
+    )
+
+    teams = build_team_seasons(df)
+
+    if teams.empty:
+        st.warning(
+            "Couldn't build team seasons. This needs `Season` and `Tm` "
+            "columns plus shot-zone and possession columns."
+        )
+    else:
+        metric_names = [
+            c for c in teams.columns if c not in ("Season", "Tm")
+        ]
+
+        team_z = st.checkbox(
+            "Compare within each season",
+            value=True,
+            key="team_within_season",
+            help="Measures each team against the league average of its "
+                 "own season, which removes era trends.",
+        )
+
+        if team_z:
+            team_values = within_group_z(
+                teams[metric_names], teams["Season"]
+            )
+        else:
+            team_values = teams[metric_names].copy()
+
+        tx, ty = st.columns(2)
+
+        default_x = (
+            metric_names.index("3PA share of shots")
+            if "3PA share of shots" in metric_names else 0
+        )
+
+        with tx:
+            team_x = st.selectbox(
+                "First statistic",
+                metric_names,
+                index=default_x,
+                key="team_x",
+            )
+
+        y_options = [m for m in metric_names if m != team_x]
+        default_y = (
+            y_options.index("Rim share of shots")
+            if "Rim share of shots" in y_options else 0
+        )
+
+        with ty:
+            team_y = st.selectbox(
+                "Second statistic",
+                y_options,
+                index=default_y,
+                key="team_y",
+            )
+
+        render_relationship(team_values, team_x, team_y, unit="team-seasons")
+
+        with st.expander("See the team-season table"):
+            st.dataframe(
+                teams.round(3),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.caption(
+            "Team possessions are estimated from player data (the sum of "
+            "each player's offensive possessions divided by 5), so "
+            "per-100 numbers are approximate."
+        )
+
 st.markdown(
     '<div class="footer">'
     'BRADBALL &nbsp; / &nbsp; DATA BEFORE ASSUMPTIONS &nbsp; / &nbsp; '
