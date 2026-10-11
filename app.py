@@ -600,6 +600,568 @@ def render_relationship(frame, x_col, y_col, weights=None, unit="rows"):
 
 
 # --------------------------------------------------
+# TEAM BUILDER HELPERS
+# --------------------------------------------------
+
+BUILDER_MIN_MINUTES = 500   # players below this don't define "league average"
+BUILDER_ALPHAS = [1, 10, 30, 100, 300, 1000, 3000, 10000]
+
+
+def _num(data, column):
+    return pd.to_numeric(data[column], errors="coerce")
+
+
+def _p100(data, column):
+    poss = _num(data, "TotalPoss") / 2
+    return (_num(data, column) / poss * 100).where(poss > 0)
+
+
+def _ratio(num, den, min_den):
+    return (num / den).where(den >= min_den)
+
+
+def _per100_feature(column):
+    return lambda d: _p100(d, column)
+
+
+def _minutes(data):
+    if "Minutes" in data.columns:
+        return _num(data, "Minutes")
+    if "SecondsPlayed" in data.columns:
+        return _num(data, "SecondsPlayed") / 60
+    return None
+
+
+# (label, columns it needs, how to compute it)
+BUILDER_FEATURES = [
+    ("3-pt attempts /100", ["FG3A"], _per100_feature("FG3A")),
+    ("3P%", ["FG3M", "FG3A"],
+     lambda d: _ratio(_num(d, "FG3M"), _num(d, "FG3A"), 50)),
+    ("Rim attempts /100", ["AtRimFGA"], _per100_feature("AtRimFGA")),
+    ("Rim FG%", ["AtRimFGM", "AtRimFGA"],
+     lambda d: _ratio(_num(d, "AtRimFGM"), _num(d, "AtRimFGA"), 50)),
+    ("Mid-range attempts /100", ["ShortMidRangeFGA", "LongMidRangeFGA"],
+     lambda d: _p100(d, "ShortMidRangeFGA") + _p100(d, "LongMidRangeFGA")),
+    ("eFG%", ["FG2M", "FG3M", "FG2A", "FG3A"],
+     lambda d: _ratio(
+         _num(d, "FG2M") + 1.5 * _num(d, "FG3M"),
+         _num(d, "FG2A") + _num(d, "FG3A"),
+         100,
+     )),
+    ("Free-throw points /100", ["FtPoints"], _per100_feature("FtPoints")),
+    ("Assists /100", ["Assists"], _per100_feature("Assists")),
+    ("Turnovers /100", ["Turnovers"], _per100_feature("Turnovers")),
+    ("Off. rebounds /100", ["OffRebounds"], _per100_feature("OffRebounds")),
+    ("Def. rebounds /100", ["DefRebounds"], _per100_feature("DefRebounds")),
+    ("Steals /100", ["Steals"], _per100_feature("Steals")),
+    ("Blocks /100", ["Blocks"], _per100_feature("Blocks")),
+    ("Assisted share of FG points",
+     ["PtsAssisted2s", "PtsAssisted3s", "FG2M", "FG3M"],
+     lambda d: _ratio(
+         _num(d, "PtsAssisted2s") + _num(d, "PtsAssisted3s"),
+         2 * _num(d, "FG2M") + 3 * _num(d, "FG3M"),
+         50,
+     )),
+]
+
+
+def _player_feature_z(data):
+    """Each player-season's stats, measured against that season's league.
+
+    A z-score of +1 means one standard deviation above the average
+    qualified player of that season. This makes players from different
+    eras comparable, so lineups can mix eras.
+    """
+    minutes = _minutes(data)
+    needed = ["Season", "TotalPoss"]
+    if minutes is None or any(c not in data.columns for c in needed):
+        return pd.DataFrame(index=data.index)
+
+    raw = pd.DataFrame(
+        {
+            label: fn(data)
+            for label, required, fn in BUILDER_FEATURES
+            if all(c in data.columns for c in required)
+        },
+        index=data.index,
+    )
+    if raw.empty:
+        return raw
+
+    qualified = minutes >= BUILDER_MIN_MINUTES
+    seasons = data["Season"]
+    ref = raw[qualified]
+    mean = ref.groupby(seasons[qualified]).mean()
+    std = ref.groupby(seasons[qualified]).std()
+
+    def align(table):
+        return pd.DataFrame(
+            table.reindex(seasons.values).to_numpy(),
+            index=data.index,
+            columns=table.columns,
+        )
+
+    z = (raw - align(mean)) / align(std).replace(0, np.nan)
+    return z.clip(-3.5, 3.5).fillna(0)
+
+
+@st.cache_data(show_spinner="Building lineup profiles...")
+def builder_tables(data):
+    """Player z-scores plus a 'core five' profile for every team-season."""
+    z = _player_feature_z(data)
+
+    if z.shape[1] < 6 or "Tm" not in data.columns:
+        return z, pd.DataFrame()
+
+    minutes = _minutes(data)
+    d = data[["Season", "Tm", "player_name"]].copy()
+    d["_min"] = minutes
+    d = d[~d["Tm"].astype(str).str.upper().str.match(r"^(TOT|\dTM)$")]
+    d = d[d["_min"] > 0]
+    d = d.sort_values(["Season", "Tm", "_min"], ascending=[True, True, False])
+
+    top = d.groupby(["Season", "Tm"]).head(5)
+    keys = [top["Season"], top["Tm"]]
+
+    profile = z.loc[top.index].groupby(keys).mean()
+    profile["Core five"] = top.groupby(["Season", "Tm"])["player_name"].agg(
+        lambda s: ", ".join(s.astype(str))
+    )
+    profile["_n"] = top.groupby(["Season", "Tm"]).size()
+    profile = profile[profile["_n"] == 5].drop(columns="_n").reset_index()
+
+    return z, profile
+
+
+def _design(features, interactions):
+    """Feature table, optionally with pairwise products and squares.
+
+    Products are the 'stacking' terms: they let the effect of one skill
+    depend on how much of another skill the group also has.
+    """
+    if not interactions:
+        return features.copy()
+
+    columns = list(features.columns)
+    extra = {}
+    for i, a in enumerate(columns):
+        for b in columns[i:]:
+            name = f"{a} (squared)" if a == b else f"{a} × {b}"
+            extra[name] = features[a] * features[b]
+
+    return pd.concat(
+        [features, pd.DataFrame(extra, index=features.index)], axis=1
+    )
+
+
+def _ridge_fit(X, y, alpha):
+    mu = X.mean(axis=0)
+    sd = X.std(axis=0)
+    sd[sd == 0] = 1.0
+    Z = (X - mu) / sd
+    y_mean = y.mean()
+    coef = np.linalg.solve(
+        Z.T @ Z + alpha * np.eye(Z.shape[1]), Z.T @ (y - y_mean)
+    )
+    return mu, sd, y_mean, coef
+
+
+def _ridge_predict(model, X):
+    mu, sd, y_mean, coef = model
+    return ((X - mu) / sd) @ coef + y_mean
+
+
+@st.cache_data(show_spinner="Fitting the model across seasons...")
+def fit_builder_models(profiles, feature_cols, target_col):
+    """Fit additive and interaction models, scored on unseen seasons.
+
+    Seasons are split into folds, and each fold is predicted by a model
+    that never saw those seasons. That out-of-sample score is the honest
+    measure of whether the model actually understands anything.
+    """
+    data = profiles.dropna(subset=[target_col]).reset_index(drop=True)
+    y = data[target_col].to_numpy(float)
+
+    seasons = data["Season"].astype(str).to_numpy()
+    unique_seasons = sorted(set(seasons))
+    k = min(5, len(unique_seasons))
+    fold_of = {s: i % k for i, s in enumerate(unique_seasons)}
+    folds = np.array([fold_of[s] for s in seasons])
+
+    total_ss = ((y - y.mean()) ** 2).sum()
+    results = {}
+
+    for name, interactions in (("additive", False), ("interact", True)):
+        design = _design(data[feature_cols], interactions)
+        X = design.to_numpy(float)
+
+        best = None
+        for alpha in BUILDER_ALPHAS:
+            oof = np.zeros(len(y))
+            for fold in range(k):
+                train, test = folds != fold, folds == fold
+                model = _ridge_fit(X[train], y[train], alpha)
+                oof[test] = _ridge_predict(model, X[test])
+            sse = float(((y - oof) ** 2).sum())
+            if best is None or sse < best[0]:
+                best = (sse, alpha, oof)
+
+        sse, alpha, oof = best
+        model = _ridge_fit(X, y, alpha)
+
+        results[name] = {
+            "alpha": alpha,
+            "r2": 1 - sse / total_ss,
+            "rmse": float(np.sqrt(sse / len(y))),
+            "oof": oof,
+            "fitted": _ridge_predict(model, X),
+            "model": model,
+            "columns": list(design.columns),
+        }
+
+    results["data"] = data[["Season", "Tm", "Era", "Core five"]].assign(
+        actual=y
+    )
+    return results
+
+
+def render_team_builder(df, player_labels, player_options):
+    """The Team Builder tab: a model learned from historical teams."""
+    st.markdown(
+        '<div class="section-label">04 / Team Builder</div>',
+        unsafe_allow_html=True
+    )
+    st.header("Build a lineup")
+
+    st.write(
+        "Pick five players and the tool predicts how that group would "
+        "have performed, using what has actually separated good teams from "
+        "bad ones historically. Nothing here is a hand-written rule: the "
+        "model learns what matters from team results, and then tells you "
+        "how well it can do that."
+    )
+
+    with st.expander("How this works, and what it can't see"):
+        st.markdown(
+            "- Each player-season is compared with the league in **its own "
+            "season**, so players from different eras can share a lineup.\n"
+            "- Each historical team is summarized by the average profile of "
+            "its **five highest-minute players**.\n"
+            "- A model learns how those profiles relate to results, and is "
+            "scored only on **seasons it hasn't seen**.\n"
+            "- A second version also gets *interaction* terms (products of "
+            "skills). If it predicts unseen seasons better, that's evidence "
+            "that skills stack beyond simple addition.\n"
+            "- **Blind spots:** defense is only visible through steals, "
+            "blocks and rebounds. Coaching, injuries, bench depth and "
+            "opponent quality aren't in the model. On/off data will help "
+            "most with defense and real pair-level synergy."
+        )
+
+    teams = build_team_seasons(df)
+    if teams.empty:
+        st.warning("The Team Lab needs to work first (Season and Tm columns).")
+        return
+
+    zfeat, profiles = builder_tables(df)
+    if profiles.empty:
+        st.warning(
+            "Not enough of the needed stat columns to build lineup "
+            "profiles (need minutes, TotalPoss, and shot/box-score stats)."
+        )
+        return
+
+    feature_cols = list(zfeat.columns)
+
+    # ---- Targets ----
+    targets = {}
+    if "Net rating (approx.)" in teams.columns:
+        targets["Net rating"] = ("Net rating (approx.)", 1)
+    if "Points per 100 poss" in teams.columns:
+        targets["Offense (points scored per 100)"] = (
+            "Points per 100 poss", 1
+        )
+    if "Points allowed per 100 poss (approx.)" in teams.columns:
+        targets["Defense (points prevented per 100)"] = (
+            "Points allowed per 100 poss (approx.)", -1
+        )
+
+    if not targets:
+        st.warning("No team results columns available to learn from.")
+        return
+
+    target_label = st.radio(
+        "What should the model predict?",
+        list(targets.keys()),
+        horizontal=True,
+        key="builder_target",
+    )
+    source_col, sign = targets[target_label]
+
+    merged = profiles.merge(
+        teams[["Season", "Tm", "Era", source_col]],
+        on=["Season", "Tm"],
+        how="left",
+    )
+    merged["_target"] = sign * (
+        merged[source_col]
+        - merged.groupby("Season")[source_col].transform("mean")
+    )
+
+    if "Net rating" in target_label:
+        season_means = teams.groupby("Season")["Net rating (approx.)"].mean()
+        if season_means.abs().max() > 2:
+            st.warning(
+                "Net rating should average about 0 in every season, but "
+                f"some seasons are off by up to {season_means.abs().max():.1f}. "
+                "That suggests PlusMinus or the possession estimate isn't "
+                "what I assumed. Treat net-rating results with suspicion, "
+                "or try the Offense target."
+            )
+
+    usable = merged["_target"].notna().sum()
+    if usable < 100 or merged["Season"].nunique() < 3:
+        st.warning(
+            f"Only {usable} usable team-seasons across "
+            f"{merged['Season'].nunique()} seasons. That's too few to "
+            "fit a trustworthy model."
+        )
+        return
+
+    results = fit_builder_models(merged, feature_cols, "_target")
+    additive, interact = results["additive"], results["interact"]
+
+    # ---- Model report card ----
+    st.markdown("#### How good is the model?")
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Sum of parts (unseen seasons)", f"{additive['r2']:.1%}")
+    m2.metric("With interactions (unseen seasons)", f"{interact['r2']:.1%}")
+    m3.metric(
+        "Typical error",
+        f"±{min(additive['rmse'], interact['rmse']):.1f} pts/100",
+    )
+
+    gain = interact["r2"] - additive["r2"]
+    if gain > 0.01:
+        st.success(
+            f"Adding interaction terms improved predictions on unseen "
+            f"seasons by {gain:.1%} points, which is some evidence that "
+            "skills stack beyond simple addition."
+        )
+        default_model = 1
+    else:
+        st.info(
+            "Interaction terms didn't clearly improve predictions on "
+            "unseen seasons. At this level of detail, a lineup looks "
+            "roughly like the sum of its parts. Finer-grained on/off data "
+            "is a better place to look for pair-level synergy."
+        )
+        default_model = 0
+
+    st.caption(
+        "The percentage is the share of team-to-team differences within "
+        "a season that the model predicts correctly on seasons it never "
+        "trained on. Real basketball has plenty this model can't see, so "
+        "a modest number is normal."
+    )
+
+    model_choice = st.radio(
+        "Model used for predictions",
+        ["Sum of parts", "With interactions"],
+        index=default_model,
+        horizontal=True,
+        key="builder_model",
+    )
+    chosen_key = "additive" if model_choice == "Sum of parts" else "interact"
+    chosen = results[chosen_key]
+
+    # ---- Pick five players ----
+    st.markdown("#### Pick five players")
+
+    minutes = _minutes(df)
+    selected_rows = []
+    slots = st.columns(5)
+
+    for i, slot in enumerate(slots):
+        with slot:
+            player_label = st.selectbox(
+                f"Player {i + 1}",
+                ["— choose —"] + player_labels,
+                key=f"bld_player_{i}",
+            )
+
+            if player_label == "— choose —":
+                selected_rows.append(None)
+                continue
+
+            player_id = player_options[player_label]
+            rows = df[df["player_id"] == player_id].sort_values("Season")
+
+            row_labels = {}
+            for idx, row in rows.iterrows():
+                team_text = f" ({row['Tm']})" if "Tm" in rows.columns else ""
+                row_labels[f"{row['Season']}{team_text}"] = idx
+
+            keys = list(row_labels.keys())
+            default_index = 0
+            if minutes is not None:
+                best_idx = minutes.loc[rows.index].idxmax()
+                for position, key in enumerate(keys):
+                    if row_labels[key] == best_idx:
+                        default_index = position
+
+            season_label = st.selectbox(
+                "Season",
+                keys,
+                index=default_index,
+                key=f"bld_season_{i}_{player_id}",
+            )
+            selected_rows.append(row_labels[season_label])
+
+    if any(r is None for r in selected_rows):
+        st.info("Choose all five players to see a prediction.")
+    elif len(set(selected_rows)) < 5:
+        st.warning("The same player-season appears more than once.")
+    else:
+        lineup_z = zfeat.loc[selected_rows, feature_cols]
+        lineup = lineup_z.mean(axis=0)
+
+        design = _design(pd.DataFrame([lineup]), chosen_key == "interact")
+        design = design[chosen["columns"]]
+        X = design.to_numpy(float)
+
+        prediction = float(_ridge_predict(chosen["model"], X)[0])
+        percentile = float((chosen["fitted"] < prediction).mean() * 100)
+
+        mu, sd, _, coef = chosen["model"]
+        contributions = pd.Series(
+            ((X[0] - mu) / sd) * coef, index=chosen["columns"]
+        )
+
+        r1, r2, r3 = st.columns(3)
+        r1.metric(
+            f"Predicted {target_label.split(' (')[0].lower()}",
+            f"{prediction:+.1f} per 100",
+            help="Relative to an average team of the same season.",
+        )
+        r2.metric("Typical error", f"±{chosen['rmse']:.1f}")
+        r3.metric("Percentile vs. historical cores", f"{percentile:.0f}th")
+
+        st.caption(
+            "Predictions are relative to a league-average team. Read the "
+            "error range as 'about two-thirds of the time, reality lands "
+            "within this of the prediction.'"
+        )
+
+        names = []
+        for idx in selected_rows:
+            row = df.loc[idx]
+            names.append(f"{row['player_name']} {row['Season']}")
+
+        st.markdown("#### What drives this prediction")
+
+        top_drivers = contributions.reindex(
+            contributions.abs().sort_values(ascending=False).index
+        ).head(10)
+        driver_table = pd.DataFrame({
+            "Factor": top_drivers.index,
+            "Effect (pts/100)": top_drivers.values.round(2),
+            "Type": [
+                "Interaction" if ("×" in f or "squared" in f) else "Skill"
+                for f in top_drivers.index
+            ],
+        })
+        st.dataframe(driver_table, use_container_width=True, hide_index=True)
+
+        st.caption(
+            "Positive effects raise the prediction. Rows marked "
+            "'Interaction' are stacking terms: they exist only when skills "
+            "combine."
+        )
+
+        with st.expander("Lineup profile (z-scores vs. each player's season)"):
+            profile_table = lineup_z.T.round(2)
+            profile_table.columns = names
+            profile_table["Lineup average"] = lineup.round(2)
+            st.dataframe(profile_table, use_container_width=True)
+            st.caption(
+                "+1.0 means one standard deviation above the average "
+                "qualified player of that season."
+            )
+
+    # ---- What the model values ----
+    with st.expander("What the model values (sum-of-parts weights)"):
+        mu, sd, _, coef = additive["model"]
+        weights = pd.DataFrame({
+            "Skill": additive["columns"],
+            "Weight": coef,
+        })
+        weights["Weight"] = weights["Weight"].round(3)
+        weights = weights.sort_values("Weight", ascending=False)
+        st.dataframe(weights, use_container_width=True, hide_index=True)
+        st.caption(
+            "Weights are per standard deviation of the group's average "
+            "profile. Many skills overlap (more threes and fewer mid-range "
+            "shots tend to go together), so don't read any single weight "
+            "as that skill's isolated effect."
+        )
+
+    # ---- Over- and under-performers ----
+    with st.expander("Teams that beat or missed their parts (synergy candidates)"):
+        history = results["data"].copy()
+        history["predicted"] = chosen["oof"]
+        history["difference"] = history["actual"] - history["predicted"]
+
+        eras_present = [
+            label for label, _, _ in ERAS
+            if label in set(history["Era"].dropna())
+        ]
+        era_pick = st.multiselect(
+            "Eras",
+            eras_present,
+            default=eras_present,
+            key="builder_eras",
+        )
+        history = history[history["Era"].isin(era_pick)]
+
+        view = history[
+            ["Season", "Tm", "Core five", "actual", "predicted", "difference"]
+        ].rename(columns={
+            "actual": "Actual",
+            "predicted": "Predicted (unseen)",
+            "difference": "Beat prediction by",
+        })
+
+        formats = {
+            "Actual": "{:+.1f}",
+            "Predicted (unseen)": "{:+.1f}",
+            "Beat prediction by": "{:+.1f}",
+        }
+
+        st.markdown("**Beat their parts the most**")
+        st.dataframe(
+            view.nlargest(10, "Beat prediction by").style.format(formats),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("**Fell short of their parts the most**")
+        st.dataframe(
+            view.nsmallest(10, "Beat prediction by").style.format(formats),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.caption(
+            "Predictions here come from models that never saw that season. "
+            "A big gap can mean synergy, coaching, health, depth, or "
+            "things this data can't see, so treat it as a place to start "
+            "looking, not a verdict."
+        )
+
+
+# --------------------------------------------------
 # HEADER
 # --------------------------------------------------
 
@@ -694,10 +1256,11 @@ st.write("")
 # NAVIGATION
 # --------------------------------------------------
 
-players_tab, compare_tab, lab_tab = st.tabs([
+players_tab, compare_tab, lab_tab, builder_tab = st.tabs([
     "🏀 Player Explorer",
     "⚖️ Compare",
     "🧪 Data Lab",
+    "🧬 Team Builder",
 ])
 
 # --------------------------------------------------
@@ -1422,6 +1985,13 @@ with lab_tab:
                     "per-100 and net rating numbers are approximate."
                 )
 
+
+# --------------------------------------------------
+# TEAM BUILDER
+# --------------------------------------------------
+
+with builder_tab:
+    render_team_builder(df, player_labels, player_options)
 
 st.markdown(
     '<div class="footer">'
