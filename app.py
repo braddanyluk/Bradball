@@ -312,6 +312,33 @@ def is_near_duplicate(a, b):
     return sa == sb or sa.startswith(sb) or sb.startswith(sa)
 
 
+STAT_GROUP_ORDER = [
+    "Scoring & shooting", "Shot locations", "Shot creation", "Playmaking",
+    "Rebounding", "Defense", "Turnovers", "Free throws & fouls", "Other",
+]
+
+# First match wins, so order matters (e.g. DefRebounds -> Rebounding).
+STAT_GROUP_RULES = [
+    ("Turnovers", ["turnover"]),
+    ("Rebounding", ["reb"]),
+    ("Free throws & fouls", ["freethrow", "ftpoint", "foul"]),
+    ("Shot locations", ["rim", "mid", "corner", "arc", "putback", "heave"]),
+    ("Shot creation", ["assisted"]),
+    ("Playmaking", ["assist"]),
+    ("Defense", ["steal", "block", "charge", "deflect"]),
+    ("Scoring & shooting", ["fg", "point", "pts", "efg", "pct", "usage"]),
+]
+
+
+def stat_group(name):
+    """Sort a column into a rough category by keywords in its name."""
+    lowered = name.lower()
+    for group, keywords in STAT_GROUP_RULES:
+        if any(k in lowered for k in keywords):
+            return group
+    return "Other"
+
+
 @st.cache_data(show_spinner="Calculating statistical relationships...")
 def calculate_relationships(data, weight_values, hide_duplicates):
     corr = data.corr(min_periods=30)
@@ -667,11 +694,10 @@ st.write("")
 # NAVIGATION
 # --------------------------------------------------
 
-players_tab, compare_tab, lab_tab, team_tab = st.tabs([
+players_tab, compare_tab, lab_tab = st.tabs([
     "🏀 Player Explorer",
     "⚖️ Compare",
     "🧪 Data Lab",
-    "🏟️ Team Lab",
 ])
 
 # --------------------------------------------------
@@ -963,7 +989,7 @@ with compare_tab:
         )
 
 # --------------------------------------------------
-# DATA LAB (player-season relationships)
+# DATA LAB (houses the Player Lab and Team Lab)
 # --------------------------------------------------
 
 with lab_tab:
@@ -972,383 +998,430 @@ with lab_tab:
         unsafe_allow_html=True
     )
 
-    st.header("Relationship Explorer")
+    st.header("Data Lab")
 
     st.write(
-        "Discover which statistical characteristics tend to move "
-        "together across player-seasons."
+        "Hunt for patterns in the data. Pick a lab: the Player Lab "
+        "looks at what players do, and the Team Lab looks at how whole "
+        "teams play."
     )
 
-    # ---- Controls ----
-    f1, f2, f3, f4 = st.columns(4)
+    lab_choice = st.selectbox(
+        "Choose a lab",
+        ["Player Lab", "Team Lab"],
+        key="lab_choice",
+    )
 
-    with f1:
-        rates_only = st.checkbox(
-            "Rates only (per-100, %, shares)",
-            value=True,
-            help="Raw totals mostly measure playing time, so they "
-                 "correlate with each other for boring reasons.",
-        )
-    with f2:
-        within_season = st.checkbox(
-            "Compare within each season",
-            value=True,
-            help="Converts each stat to a z-score inside its own season, "
-                 "so league-wide trends don't create fake relationships.",
-        )
-    with f3:
-        hide_duplicates = st.checkbox(
-            "Hide near-duplicate pairs",
-            value=True,
-            help="Hides pairs like FG3M vs FG3A that are linked by definition.",
-        )
-    with f4:
-        min_minutes = st.slider(
-            "Minimum minutes",
-            min_value=0,
-            max_value=2000,
-            value=300,
-            step=50,
-            help="Set to 0 to include everyone.",
+    st.divider()
+
+    if lab_choice == "Player Lab":
+        st.subheader("Player Lab")
+
+        st.write(
+            "Discover which statistical characteristics tend to move "
+            "together across player-seasons."
         )
 
-    # ---- Minutes column (for filter and weighting) ----
-    if "Minutes" in df.columns:
-        minutes = pd.to_numeric(df["Minutes"], errors="coerce")
-    elif "SecondsPlayed" in df.columns:
-        minutes = pd.to_numeric(df["SecondsPlayed"], errors="coerce") / 60
-    else:
-        minutes = None
+        # ---- Controls ----
+        f1, f2, f3, f4 = st.columns(4)
 
-    if minutes is not None:
-        lab_mask = minutes.fillna(0) >= min_minutes
-    else:
-        lab_mask = pd.Series(True, index=df.index)
+        with f1:
+            rates_only = st.checkbox(
+                "Rates only (per-100, %, shares)",
+                value=True,
+                help="Raw totals mostly measure playing time, so they "
+                     "correlate with each other for boring reasons.",
+            )
+        with f2:
+            within_season = st.checkbox(
+                "Compare within each season",
+                value=True,
+                help="Converts each stat to a z-score inside its own season, "
+                     "so league-wide trends don't create fake relationships.",
+            )
+        with f3:
+            hide_duplicates = st.checkbox(
+                "Hide near-duplicate pairs",
+                value=True,
+                help="Hides pairs like FG3M vs FG3A that are linked by definition.",
+            )
+        with f4:
+            min_minutes = st.slider(
+                "Minimum minutes",
+                min_value=0,
+                max_value=2000,
+                value=300,
+                step=50,
+                help="Set to 0 to include everyone.",
+            )
 
-    lab_df = df[lab_mask]
-    lab_weights = minutes[lab_mask] if minutes is not None else None
+        # ---- Minutes column (for filter and weighting) ----
+        if "Minutes" in df.columns:
+            minutes = pd.to_numeric(df["Minutes"], errors="coerce")
+        elif "SecondsPlayed" in df.columns:
+            minutes = pd.to_numeric(df["SecondsPlayed"], errors="coerce") / 60
+        else:
+            minutes = None
 
-    # ---- Choose columns ----
-    excluded_names = {
-        "player_id", "player_name", "player", "season",
-        "age", "year", "rank", "number", "jersey",
-        "team", "tm", "gamesplayed", "g",
-        "minutes", "secondsplayed", "mp",
-        "totalposs", "offposs", "defposs",
-    }
-    alias_columns = {
-        "PTS", "TRB", "AST", "STL", "BLK", "TOV", "MP", "G",
-    }
+        if minutes is not None:
+            lab_mask = minutes.fillna(0) >= min_minutes
+        else:
+            lab_mask = pd.Series(True, index=df.index)
 
-    numeric_data = pd.DataFrame(index=lab_df.index)
+        lab_df = df[lab_mask]
+        lab_weights = minutes[lab_mask] if minutes is not None else None
 
-    for column in lab_df.columns:
-        if column.lower() in excluded_names or column in alias_columns:
-            continue
-        if column.endswith("PerGame"):
-            continue
-        if rates_only and not is_rate_column(column):
-            continue
+        # ---- Stat groups (narrow the field without losing anything) ----
+        group_of = {c: stat_group(c) for c in lab_df.columns}
 
-        values = pd.to_numeric(lab_df[column], errors="coerce")
-
-        if values.notna().sum() < 30:
-            continue
-        if values.nunique(dropna=True) < 2:
-            continue
-
-        numeric_data[column] = values
-
-    if within_season and "Season" in lab_df.columns and len(numeric_data.columns):
-        numeric_data = within_group_z(numeric_data, lab_df["Season"])
-
-    if len(numeric_data.columns) < 2 or len(numeric_data) < 30:
-        st.warning(
-            "Not enough data with these settings. Try lowering the "
-            "minimum minutes or turning off 'Rates only'."
+        selected_groups = st.multiselect(
+            "Stat groups to include",
+            STAT_GROUP_ORDER,
+            default=STAT_GROUP_ORDER,
+            help="Categories are guessed from column names. Untick groups "
+                 "to focus; 'Other' holds anything that didn't fit.",
         )
 
-    else:
-        relationships = calculate_relationships(
-            numeric_data,
-            lab_weights,
-            hide_duplicates,
-        )
+        # ---- Choose columns ----
+        excluded_names = {
+            "player_id", "player_name", "player", "season",
+            "age", "year", "rank", "number", "jersey",
+            "team", "tm", "gamesplayed", "g",
+            "minutes", "secondsplayed", "mp",
+            "totalposs", "offposs", "defposs",
+        }
+        alias_columns = {
+            "PTS", "TRB", "AST", "STL", "BLK", "TOV", "MP", "G",
+        }
 
-        if relationships.empty:
-            st.warning("No valid relationships could be calculated.")
+        numeric_data = pd.DataFrame(index=lab_df.index)
+
+        for column in lab_df.columns:
+            if column.lower() in excluded_names or column in alias_columns:
+                continue
+            if column.endswith("PerGame"):
+                continue
+            if group_of.get(column) not in selected_groups:
+                continue
+            if rates_only and not is_rate_column(column):
+                continue
+
+            values = pd.to_numeric(lab_df[column], errors="coerce")
+
+            if values.notna().sum() < 30:
+                continue
+            if values.nunique(dropna=True) < 2:
+                continue
+
+            numeric_data[column] = values
+
+        if within_season and "Season" in lab_df.columns and len(numeric_data.columns):
+            numeric_data = within_group_z(numeric_data, lab_df["Season"])
+
+        if len(numeric_data.columns) < 2 or len(numeric_data) < 30:
+            st.warning(
+                "Not enough data with these settings. Try lowering the "
+                "minimum minutes or turning off 'Rates only'."
+            )
 
         else:
-            st.caption(
-                f"Analyzed {len(numeric_data.columns)} statistics across "
-                f"{len(numeric_data):,} player-seasons. Minutes-weighted "
-                "results are calculated for the 200 strongest ordinary "
-                "relationships."
-            )
-
-            ranking_choice = st.radio(
-                "Explore relationships",
-                [
-                    "Strongest positive",
-                    "Strongest negative",
-                    "Weakest relationships",
-                ],
-                horizontal=True,
-                key="relationship_ranking",
-            )
-
-            if ranking_choice == "Strongest positive":
-                ranked = relationships.sort_values(
-                    "Correlation", ascending=False
-                )
-            elif ranking_choice == "Strongest negative":
-                ranked = relationships.sort_values(
-                    "Correlation", ascending=True
-                )
-            else:
-                ranked = relationships.assign(
-                    abs_r=relationships["Correlation"].abs()
-                ).sort_values("abs_r")
-
-            st.dataframe(
-                ranked.head(20)[
-                    [
-                        "Statistic A",
-                        "Statistic B",
-                        "Correlation",
-                        "Minutes-weighted",
-                        "Player-seasons",
-                    ]
-                ].style.format({
-                    "Correlation": "{:+.3f}",
-                    "Minutes-weighted": "{:+.3f}",
-                }),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            st.markdown("#### Investigate a relationship")
-
-            available_stats = sorted(
-                numeric_data.columns,
-                key=str.lower,
-            )
-
-            first_stat, second_stat = st.columns(2)
-
-            with first_stat:
-                selected_x = st.selectbox(
-                    "First statistic",
-                    available_stats,
-                    key="relationship_x",
-                )
-
-            with second_stat:
-                selected_y = st.selectbox(
-                    "Second statistic",
-                    [col for col in available_stats if col != selected_x],
-                    key="relationship_y",
-                )
-
-            render_relationship(
+            relationships = calculate_relationships(
                 numeric_data,
-                selected_x,
-                selected_y,
-                weights=lab_weights,
-                unit="player-seasons",
+                lab_weights,
+                hide_duplicates,
             )
 
-            st.info(
-                "Research note: players contribute multiple seasons, so "
-                "observations are not independent. Player-level "
-                "relationships also reflect position (guards shoot threes, "
-                "centers shoot at the rim). For questions about how a "
-                "team plays, use the Team Lab."
-            )
+            if relationships.empty:
+                st.warning("No valid relationships could be calculated.")
 
-# --------------------------------------------------
-# TEAM LAB (team-season relationships)
-# --------------------------------------------------
-
-with team_tab:
-    st.markdown(
-        '<div class="section-label">04 / Team Lab</div>',
-        unsafe_allow_html=True
-    )
-
-    st.header("How teams play")
-
-    st.write(
-        "Each dot is one team in one season. Use this for questions about "
-        "style, like whether shooting more threes goes with more shots at "
-        "the rim."
-    )
-
-    teams = build_team_seasons(df)
-
-    if teams.empty:
-        needed = ["Season", "Tm", "FG3A", "AtRimFGA", "OffPoss"]
-        missing = [c for c in needed if c not in df.columns]
-
-        st.warning(
-            "Couldn't build team seasons. Missing columns in "
-            f"`player_seasons.csv.gz`: {', '.join(missing) or 'none'}."
-        )
-
-        with st.expander("Diagnostic info (paste this to Claude)"):
-            st.write("**Columns in player_seasons.csv.gz:**")
-            st.code(", ".join(map(str, df.columns)))
-
-            try:
-                name_cols = pd.read_csv(NAME_FILE, nrows=3)
-                st.write("**Columns in player_team_seasons.csv:**")
-                st.code(", ".join(map(str, name_cols.columns)))
-                st.write("**First rows of player_team_seasons.csv:**")
-                st.dataframe(name_cols, hide_index=True)
-            except Exception as error:
-                st.write(f"Couldn't read the name file: {error}")
-
-            if "Tm" in df.columns:
-                st.write("**Sample team values:**")
-                st.code(", ".join(map(str, df["Tm"].dropna().unique()[:15])))
-    else:
-        metric_names = [
-            c for c in teams.columns if c not in ("Season", "Tm", "Era")
-        ]
-
-        # ---- Era filter ----
-        present_eras = [
-            label for label, _, _ in ERAS
-            if label in set(teams["Era"].dropna())
-        ]
-
-        selected_eras = st.multiselect(
-            "Eras to include",
-            present_eras,
-            default=present_eras,
-            help="Era boundaries use each season's starting year. "
-                 "Pick one era to see how a relationship looks in that "
-                 "period alone.",
-        )
-
-        team_z = st.checkbox(
-            "Compare within each season",
-            value=True,
-            key="team_within_season",
-            help="Measures each team against the league average of its "
-                 "own season, which removes era trends.",
-        )
-
-        # Z-scores are always computed within a season, so filtering by
-        # era afterward doesn't change them.
-        if team_z:
-            team_values = within_group_z(
-                teams[metric_names], teams["Season"]
-            )
-        else:
-            team_values = teams[metric_names].copy()
-
-        era_mask = teams["Era"].isin(selected_eras)
-
-        if not era_mask.any():
-            st.info("Select at least one era.")
-        else:
-            tx, ty = st.columns(2)
-
-            default_x = (
-                metric_names.index("3PA share of shots")
-                if "3PA share of shots" in metric_names else 0
-            )
-
-            with tx:
-                team_x = st.selectbox(
-                    "First statistic",
-                    metric_names,
-                    index=default_x,
-                    key="team_x",
+            else:
+                st.caption(
+                    f"Analyzed {len(numeric_data.columns)} statistics across "
+                    f"{len(numeric_data):,} player-seasons. Minutes-weighted "
+                    "results are calculated for the 200 strongest ordinary "
+                    "relationships."
                 )
 
-            y_options = [m for m in metric_names if m != team_x]
-            default_y = (
-                y_options.index("Rim share of shots")
-                if "Rim share of shots" in y_options else 0
-            )
-
-            with ty:
-                team_y = st.selectbox(
-                    "Second statistic",
-                    y_options,
-                    index=default_y,
-                    key="team_y",
+                available_stats = sorted(
+                    numeric_data.columns,
+                    key=str.lower,
                 )
 
-            render_relationship(
-                team_values[era_mask],
-                team_x,
-                team_y,
-                unit="team-seasons",
-            )
+                focus_stat = st.selectbox(
+                    "Focus on one statistic (optional, type to search)",
+                    ["All statistics"] + available_stats,
+                    key="lab_focus",
+                )
 
-            # ---- Same relationship, era by era ----
-            st.markdown("#### Does it change by era?")
+                rows_to_show = st.select_slider(
+                    "Rows to show",
+                    options=[10, 15, 25, 50],
+                    value=15,
+                    key="lab_rows",
+                )
 
-            era_rows = []
-            for label in present_eras:
-                rows = (teams["Era"] == label)
-                pair = team_values.loc[rows, [team_x, team_y]].dropna()
-                if len(pair) >= 10:
-                    era_rows.append({
-                        "Era": label,
-                        "Correlation": pair[team_x].corr(pair[team_y]),
-                        "Team-seasons": len(pair),
-                    })
+                ranking_choice = st.radio(
+                    "Explore relationships",
+                    [
+                        "Strongest positive",
+                        "Strongest negative",
+                        "Weakest relationships",
+                    ],
+                    horizontal=True,
+                    key="relationship_ranking",
+                )
 
-            if era_rows:
+                if ranking_choice == "Strongest positive":
+                    ranked = relationships.sort_values(
+                        "Correlation", ascending=False
+                    )
+                elif ranking_choice == "Strongest negative":
+                    ranked = relationships.sort_values(
+                        "Correlation", ascending=True
+                    )
+                else:
+                    ranked = relationships.assign(
+                        abs_r=relationships["Correlation"].abs()
+                    ).sort_values("abs_r")
+
+                if focus_stat != "All statistics":
+                    ranked = ranked[
+                        (ranked["Statistic A"] == focus_stat)
+                        | (ranked["Statistic B"] == focus_stat)
+                    ]
+
                 st.dataframe(
-                    pd.DataFrame(era_rows).style.format(
-                        {"Correlation": "{:+.3f}"}
-                    ),
+                    ranked.head(rows_to_show)[
+                        [
+                            "Statistic A",
+                            "Statistic B",
+                            "Correlation",
+                            "Minutes-weighted",
+                            "Player-seasons",
+                        ]
+                    ].style.format({
+                        "Correlation": "{:+.3f}",
+                        "Minutes-weighted": "{:+.3f}",
+                    }),
                     use_container_width=True,
                     hide_index=True,
                 )
-                st.caption(
-                    "Eras with fewer than 10 team-seasons are left out. "
-                    "Small eras swing a lot, so look for patterns that "
-                    "hold across several eras."
+
+                st.markdown("#### Investigate a relationship")
+
+                available_stats = sorted(
+                    numeric_data.columns,
+                    key=str.lower,
+                )
+
+                first_stat, second_stat = st.columns(2)
+
+                with first_stat:
+                    selected_x = st.selectbox(
+                        "First statistic",
+                        available_stats,
+                        key="relationship_x",
+                    )
+
+                with second_stat:
+                    selected_y = st.selectbox(
+                        "Second statistic",
+                        [col for col in available_stats if col != selected_x],
+                        key="relationship_y",
+                    )
+
+                render_relationship(
+                    numeric_data,
+                    selected_x,
+                    selected_y,
+                    weights=lab_weights,
+                    unit="player-seasons",
+                )
+
+                st.info(
+                    "Research note: players contribute multiple seasons, so "
+                    "observations are not independent. Player-level "
+                    "relationships also reflect position (guards shoot threes, "
+                    "centers shoot at the rim). For questions about how a "
+                    "team plays, use the Team Lab."
+                )
+
+
+    else:
+        st.subheader("Team Lab")
+
+        st.write(
+            "Each dot is one team in one season. Use this for questions about "
+            "style, like whether shooting more threes goes with more shots at "
+            "the rim."
+        )
+
+        teams = build_team_seasons(df)
+
+        if teams.empty:
+            needed = ["Season", "Tm", "FG3A", "AtRimFGA", "OffPoss"]
+            missing = [c for c in needed if c not in df.columns]
+
+            st.warning(
+                "Couldn't build team seasons. Missing columns in "
+                f"`player_seasons.csv.gz`: {', '.join(missing) or 'none'}."
+            )
+
+            with st.expander("Diagnostic info (paste this to Claude)"):
+                st.write("**Columns in player_seasons.csv.gz:**")
+                st.code(", ".join(map(str, df.columns)))
+
+                try:
+                    name_cols = pd.read_csv(NAME_FILE, nrows=3)
+                    st.write("**Columns in player_team_seasons.csv:**")
+                    st.code(", ".join(map(str, name_cols.columns)))
+                    st.write("**First rows of player_team_seasons.csv:**")
+                    st.dataframe(name_cols, hide_index=True)
+                except Exception as error:
+                    st.write(f"Couldn't read the name file: {error}")
+
+                if "Tm" in df.columns:
+                    st.write("**Sample team values:**")
+                    st.code(", ".join(map(str, df["Tm"].dropna().unique()[:15])))
+        else:
+            metric_names = [
+                c for c in teams.columns if c not in ("Season", "Tm", "Era")
+            ]
+
+            # ---- Era filter ----
+            present_eras = [
+                label for label, _, _ in ERAS
+                if label in set(teams["Era"].dropna())
+            ]
+
+            selected_eras = st.multiselect(
+                "Eras to include",
+                present_eras,
+                default=present_eras,
+                help="Era boundaries use each season's starting year. "
+                     "Pick one era to see how a relationship looks in that "
+                     "period alone.",
+            )
+
+            team_z = st.checkbox(
+                "Compare within each season",
+                value=True,
+                key="team_within_season",
+                help="Measures each team against the league average of its "
+                     "own season, which removes era trends.",
+            )
+
+            # Z-scores are always computed within a season, so filtering by
+            # era afterward doesn't change them.
+            if team_z:
+                team_values = within_group_z(
+                    teams[metric_names], teams["Season"]
                 )
             else:
-                st.caption("Not enough team-seasons per era to compare.")
+                team_values = teams[metric_names].copy()
 
-            # ---- What moves with the first statistic ----
-            with st.expander(f"What correlates with “{team_x}”?"):
-                subset = team_values.loc[era_mask, metric_names]
-                related = (
-                    subset.corr(min_periods=10)[team_x]
-                    .drop(team_x)
-                    .dropna()
-                    .sort_values(ascending=False)
-                )
-                related_table = related.reset_index()
-                related_table.columns = ["Statistic", "Correlation"]
+            era_mask = teams["Era"].isin(selected_eras)
 
-                st.dataframe(
-                    related_table.style.format({"Correlation": "{:+.3f}"}),
-                    use_container_width=True,
-                    hide_index=True,
+            if not era_mask.any():
+                st.info("Select at least one era.")
+            else:
+                tx, ty = st.columns(2)
+
+                default_x = (
+                    metric_names.index("3PA share of shots")
+                    if "3PA share of shots" in metric_names else 0
                 )
 
-            with st.expander("See the team-season table"):
-                st.dataframe(
-                    teams[era_mask].round(3),
-                    use_container_width=True,
-                    hide_index=True,
+                with tx:
+                    team_x = st.selectbox(
+                        "First statistic",
+                        metric_names,
+                        index=default_x,
+                        key="team_x",
+                    )
+
+                y_options = [m for m in metric_names if m != team_x]
+                default_y = (
+                    y_options.index("Rim share of shots")
+                    if "Rim share of shots" in y_options else 0
                 )
 
-            st.caption(
-                "Team possessions are estimated from player data (the sum "
-                "of each player's offensive possessions divided by 5), so "
-                "per-100 and net rating numbers are approximate."
-            )
+                with ty:
+                    team_y = st.selectbox(
+                        "Second statistic",
+                        y_options,
+                        index=default_y,
+                        key="team_y",
+                    )
+
+                render_relationship(
+                    team_values[era_mask],
+                    team_x,
+                    team_y,
+                    unit="team-seasons",
+                )
+
+                # ---- Same relationship, era by era ----
+                st.markdown("#### Does it change by era?")
+
+                era_rows = []
+                for label in present_eras:
+                    rows = (teams["Era"] == label)
+                    pair = team_values.loc[rows, [team_x, team_y]].dropna()
+                    if len(pair) >= 10:
+                        era_rows.append({
+                            "Era": label,
+                            "Correlation": pair[team_x].corr(pair[team_y]),
+                            "Team-seasons": len(pair),
+                        })
+
+                if era_rows:
+                    st.dataframe(
+                        pd.DataFrame(era_rows).style.format(
+                            {"Correlation": "{:+.3f}"}
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.caption(
+                        "Eras with fewer than 10 team-seasons are left out. "
+                        "Small eras swing a lot, so look for patterns that "
+                        "hold across several eras."
+                    )
+                else:
+                    st.caption("Not enough team-seasons per era to compare.")
+
+                # ---- What moves with the first statistic ----
+                with st.expander(f"What correlates with “{team_x}”?"):
+                    subset = team_values.loc[era_mask, metric_names]
+                    related = (
+                        subset.corr(min_periods=10)[team_x]
+                        .drop(team_x)
+                        .dropna()
+                        .sort_values(ascending=False)
+                    )
+                    related_table = related.reset_index()
+                    related_table.columns = ["Statistic", "Correlation"]
+
+                    st.dataframe(
+                        related_table.style.format({"Correlation": "{:+.3f}"}),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                with st.expander("See the team-season table"):
+                    st.dataframe(
+                        teams[era_mask].round(3),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                st.caption(
+                    "Team possessions are estimated from player data (the sum "
+                    "of each player's offensive possessions divided by 5), so "
+                    "per-100 and net rating numbers are approximate."
+                )
+
 
 st.markdown(
     '<div class="footer">'
