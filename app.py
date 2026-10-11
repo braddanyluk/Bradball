@@ -665,17 +665,36 @@ BUILDER_FEATURES = [
 ]
 
 
+# Resources a team only has so much of. Five players can't each keep
+# their own full share of the shots, assists or rebounds.
+POOL_DEFS = [
+    ("Shot attempts",
+     ["3-pt attempts /100", "Rim attempts /100", "Mid-range attempts /100"]),
+    ("Free-throw points", ["Free-throw points /100"]),
+    ("Assists", ["Assists /100"]),
+    ("Turnovers", ["Turnovers /100"]),
+    ("Offensive rebounds", ["Off. rebounds /100"]),
+    ("Defensive rebounds", ["Def. rebounds /100"]),
+    ("Steals", ["Steals /100"]),
+    ("Blocks", ["Blocks /100"]),
+]
+
+
 def _player_feature_z(data):
     """Each player-season's stats, measured against that season's league.
 
     A z-score of +1 means one standard deviation above the average
     qualified player of that season. This makes players from different
     eras comparable, so lineups can mix eras.
+
+    Returns (z-scores, raw values, season means, season standard deviations).
     """
     minutes = _minutes(data)
     needed = ["Season", "TotalPoss"]
+    blank = pd.DataFrame(index=data.index)
+
     if minutes is None or any(c not in data.columns for c in needed):
-        return pd.DataFrame(index=data.index)
+        return blank, blank, pd.DataFrame(), pd.DataFrame()
 
     raw = pd.DataFrame(
         {
@@ -686,7 +705,7 @@ def _player_feature_z(data):
         index=data.index,
     )
     if raw.empty:
-        return raw
+        return raw, raw, pd.DataFrame(), pd.DataFrame()
 
     qualified = minutes >= BUILDER_MIN_MINUTES
     seasons = data["Season"]
@@ -702,16 +721,17 @@ def _player_feature_z(data):
         )
 
     z = (raw - align(mean)) / align(std).replace(0, np.nan)
-    return z.clip(-3.5, 3.5).fillna(0)
+    return z.clip(-3.5, 3.5).fillna(0), raw, mean, std
 
 
 @st.cache_data(show_spinner="Building lineup profiles...")
 def builder_tables(data):
-    """Player z-scores plus a 'core five' profile for every team-season."""
-    z = _player_feature_z(data)
+    """Player z-scores, a 'core five' profile per team-season, and the
+    historical limits on shared resources."""
+    z, raw, mean_table, std_table = _player_feature_z(data)
 
     if z.shape[1] < 6 or "Tm" not in data.columns:
-        return z, pd.DataFrame()
+        return z, pd.DataFrame(), {}
 
     minutes = _minutes(data)
     d = data[["Season", "Tm", "player_name"]].copy()
@@ -727,10 +747,75 @@ def builder_tables(data):
     profile["Core five"] = top.groupby(["Season", "Tm"])["player_name"].agg(
         lambda s: ", ".join(s.astype(str))
     )
-    profile["_n"] = top.groupby(["Season", "Tm"]).size()
+    sizes = top.groupby(["Season", "Tm"]).size()
+    profile["_n"] = sizes
     profile = profile[profile["_n"] == 5].drop(columns="_n").reset_index()
 
-    return z, profile
+    # How much of each shared resource has any real top five ever used?
+    full_cores = sizes[sizes == 5].index
+    pool_defs, caps = [], {}
+    for name, members in POOL_DEFS:
+        members = [m for m in members if m in raw.columns]
+        if not members:
+            continue
+        totals = (
+            raw.loc[top.index, members].sum(axis=1).groupby(keys).sum()
+        )
+        totals = totals.loc[totals.index.isin(full_cores)].dropna()
+        if len(totals) < 30:
+            continue
+        pool_defs.append((name, members))
+        caps[name] = {
+            "cap": float(np.percentile(totals, 99)),
+            "typical": float(np.median(totals)),
+        }
+
+    pools = {
+        "raw": raw,
+        "mean": mean_table,
+        "std": std_table,
+        "defs": pool_defs,
+        "caps": caps,
+    }
+    return z, profile, pools
+
+
+def apply_pool_limits(data, zfeat, pools, rows, feature_cols):
+    """Shrink every player's slice when the five together want more of a
+    shared resource than any real top five has ever had.
+
+    Returns the adjusted z-scores and a report of what was scaled.
+    """
+    z = zfeat.loc[rows, feature_cols].copy()
+    raw = pools["raw"].loc[rows]
+    seasons = data.loc[rows, "Season"].to_numpy()
+    report = []
+
+    for name, members in pools["defs"]:
+        wanted = float(raw[members].sum().sum())
+        cap = pools["caps"][name]["cap"]
+        typical = pools["caps"][name]["typical"]
+        factor = min(1.0, cap / wanted) if wanted > 0 else 1.0
+
+        report.append({
+            "Resource": name,
+            "Five players would use": wanted,
+            "Typical top five": typical,
+            "Most ever": cap,
+            "Everyone scaled to": factor,
+        })
+
+        if factor < 1.0:
+            for member in members:
+                mean = pools["mean"][member].reindex(seasons).to_numpy(float)
+                std = pools["std"][member].reindex(seasons).to_numpy(float)
+                std = np.where(std == 0, np.nan, std)
+                scaled = raw[member].to_numpy(float) * factor
+                z[member] = np.nan_to_num(
+                    np.clip((scaled - mean) / std, -3.5, 3.5)
+                )
+
+    return z, report
 
 
 def _design(features, interactions):
@@ -819,6 +904,20 @@ def fit_builder_models(profiles, feature_cols, target_col):
             "columns": list(design.columns),
         }
 
+    # What do real historical cores look like? Used by the guardrails.
+    F = data[feature_cols].to_numpy(float)
+    center = F.mean(axis=0)
+    cov = np.cov(F, rowvar=False) + 1e-6 * np.eye(F.shape[1])
+    inverse = np.linalg.inv(cov)
+    centered = F - center
+    results["support"] = {
+        "mu": center,
+        "inv": inverse,
+        "d2": np.einsum("ij,jk,ik->i", centered, inverse, centered),
+        "lo": np.percentile(F, 1, axis=0),
+        "hi": np.percentile(F, 99, axis=0),
+    }
+
     results["data"] = data[["Season", "Tm", "Era", "Core five"]].assign(
         actual=y
     )
@@ -852,6 +951,14 @@ def render_team_builder(df, player_labels, player_options):
             "- A second version also gets *interaction* terms (products of "
             "skills). If it predicts unseen seasons better, that's evidence "
             "that skills stack beyond simple addition.\n"
+            "- **Shared resources:** a team only has so many shots, "
+            "assists and rebounds. If five players together would use more "
+            "than any real top five ever has, everyone's share is scaled "
+            "down to fit.\n"
+            "- **Guardrails:** if a lineup is more extreme than any real "
+            "team, the model is only shown values it has seen, the "
+            "prediction is shrunk toward average, and the error range is "
+            "hidden, because the model can't know what happens there.\n"
             "- **Blind spots:** defense is only visible through steals, "
             "blocks and rebounds. Coaching, injuries, bench depth and "
             "opponent quality aren't in the model. On/off data will help "
@@ -863,7 +970,7 @@ def render_team_builder(df, player_labels, player_options):
         st.warning("The Team Lab needs to work first (Season and Tm columns).")
         return
 
-    zfeat, profiles = builder_tables(df)
+    zfeat, profiles, pools = builder_tables(df)
     if profiles.empty:
         st.warning(
             "Not enough of the needed stat columns to build lineup "
@@ -973,6 +1080,13 @@ def render_team_builder(df, player_labels, player_options):
         horizontal=True,
         key="builder_model",
     )
+    st.caption(
+        "Interaction models are more flexible, which also makes them more "
+        "likely to run wild on unusual lineups. The guardrails below "
+        "limit that, but 'Sum of parts' is the safer choice for exotic "
+        "groups."
+    )
+
     chosen_key = "additive" if model_choice == "Sum of parts" else "interact"
     chosen = results[chosen_key]
 
@@ -1024,20 +1138,74 @@ def render_team_builder(df, player_labels, player_options):
     elif len(set(selected_rows)) < 5:
         st.warning("The same player-season appears more than once.")
     else:
-        lineup_z = zfeat.loc[selected_rows, feature_cols]
-        lineup = lineup_z.mean(axis=0)
-
-        design = _design(pd.DataFrame([lineup]), chosen_key == "interact")
-        design = design[chosen["columns"]]
-        X = design.to_numpy(float)
-
-        prediction = float(_ridge_predict(chosen["model"], X)[0])
-        percentile = float((chosen["fitted"] < prediction).mean() * 100)
-
-        mu, sd, _, coef = chosen["model"]
-        contributions = pd.Series(
-            ((X[0] - mu) / sd) * coef, index=chosen["columns"]
+        lineup_z, pool_report = apply_pool_limits(
+            df, zfeat, pools, selected_rows, feature_cols
         )
+        lineup = lineup_z.mean(axis=0)
+        support = results["support"]
+
+        raw_vec = lineup.to_numpy(float)
+
+        # How far is this group from anything that ever actually played?
+        centered = raw_vec - support["mu"]
+        lineup_d2 = float(centered @ support["inv"] @ centered)
+        unusual_pct = float((support["d2"] < lineup_d2).mean() * 100)
+        beyond_history = lineup_d2 > float(support["d2"].max())
+
+        # Guardrail 1: the model may only be fed values it has seen before.
+        clipped_vec = np.clip(raw_vec, support["lo"], support["hi"])
+        outside = []
+        for i, feature in enumerate(feature_cols):
+            if raw_vec[i] > support["hi"][i] + 1e-9:
+                outside.append((feature, raw_vec[i], support["hi"][i],
+                                raw_vec[i] - support["hi"][i]))
+            elif raw_vec[i] < support["lo"][i] - 1e-9:
+                outside.append((feature, raw_vec[i], support["lo"][i],
+                                support["lo"][i] - raw_vec[i]))
+
+        def model_output(vector):
+            row = _design(
+                pd.DataFrame([vector], columns=feature_cols),
+                chosen_key == "interact",
+            )[chosen["columns"]]
+            values = row.to_numpy(float)
+            return values, float(_ridge_predict(chosen["model"], values)[0])
+
+        X, clipped_prediction = model_output(clipped_vec)
+        _, unadjusted_prediction = model_output(raw_vec)
+
+        # Guardrail 2: far outside all history, shrink toward average.
+        trust = 1.0
+        if beyond_history:
+            trust = float(np.sqrt(support["d2"].max() / lineup_d2))
+        prediction = clipped_prediction * trust
+
+        # Guardrail 3: don't claim more than the best team in the data.
+        best_seen = float(results["data"]["actual"].max())
+        worst_seen = float(results["data"]["actual"].min())
+        capped_by_history = False
+        model_number = prediction
+        if prediction > best_seen:
+            prediction, capped_by_history = best_seen, True
+        elif prediction < worst_seen:
+            prediction, capped_by_history = worst_seen, True
+
+        model_mu, model_sd, _, coef = chosen["model"]
+        contributions = pd.Series(
+            ((X[0] - model_mu) / model_sd) * coef * trust,
+            index=chosen["columns"],
+        )
+
+        if beyond_history:
+            unusual_label = "Unlike any in history"
+        elif unusual_pct >= 99:
+            unusual_label = "Extreme"
+        elif unusual_pct >= 90:
+            unusual_label = "Very unusual"
+        elif unusual_pct >= 70:
+            unusual_label = "Unusual"
+        else:
+            unusual_label = "Typical"
 
         r1, r2, r3 = st.columns(3)
         r1.metric(
@@ -1045,8 +1213,110 @@ def render_team_builder(df, player_labels, player_options):
             f"{prediction:+.1f} per 100",
             help="Relative to an average team of the same season.",
         )
-        r2.metric("Typical error", f"±{chosen['rmse']:.1f}")
-        r3.metric("Percentile vs. historical cores", f"{percentile:.0f}th")
+        r2.metric(
+            "Typical error",
+            "Unknown"
+            if (beyond_history or capped_by_history)
+            else f"±{chosen['rmse']:.1f}",
+            help="Only meaningful for lineups resembling real teams.",
+        )
+        r3.metric(
+            "How unusual is this group?",
+            unusual_label,
+            help=f"More unusual than {unusual_pct:.0f}% of real "
+                 "historical cores.",
+        )
+
+        scaled_any = any(r["Everyone scaled to"] < 0.98 for r in pool_report)
+
+        if scaled_any:
+            st.markdown("#### Not enough to go around")
+            st.write(
+                "Per-100 stats assume a player keeps his usual share. "
+                "Together these five want more of some things than any "
+                "real top five has ever had, so everyone's slice was "
+                "shrunk to fit."
+            )
+            pool_table = pd.DataFrame(pool_report)
+            shown = pool_table[pool_table["Everyone scaled to"] < 0.98]
+            st.dataframe(
+                shown.style.format({
+                    "Five players would use": "{:.1f}",
+                    "Typical top five": "{:.1f}",
+                    "Most ever": "{:.1f}",
+                    "Everyone scaled to": "{:.0%}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption(
+                "Units are per 100 possessions, summed across the five. "
+                "Efficiency stats (like 3P%) are left alone, which is "
+                "probably generous: real players usually shoot a bit "
+                "worse when asked to do more."
+            )
+        else:
+            with st.expander("Shared resources (nothing needed scaling)"):
+                st.dataframe(
+                    pd.DataFrame(pool_report).style.format({
+                        "Five players would use": "{:.1f}",
+                        "Typical top five": "{:.1f}",
+                        "Most ever": "{:.1f}",
+                        "Everyone scaled to": "{:.0%}",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        if capped_by_history:
+            st.warning(
+                f"The model's number was {model_number:+.1f}, which is "
+                f"beyond any real team in the data (best: {best_seen:+.1f}, "
+                f"worst: {worst_seen:+.1f}). It's shown capped. Read it as "
+                "'at least as good as the best team ever recorded, by "
+                "this model's reckoning,' not as a forecast."
+            )
+
+        if beyond_history:
+            st.error(
+                "This group is unlike anything in the data. Real teams "
+                "never had five players like this, so the model has "
+                "nothing to learn from here. The number above has been "
+                "held back toward average, and it should be read as "
+                "'unknown', not as a prediction."
+            )
+        elif unusual_pct >= 99:
+            st.warning(
+                "This group is more extreme than 99% of real historical "
+                "cores. Treat the prediction as shaky."
+            )
+
+        if outside or abs(unadjusted_prediction - prediction) > 0.05:
+            st.caption(
+                f"Raw model output was {unadjusted_prediction:+.1f}. "
+                f"Guardrails limited it to {prediction:+.1f}."
+            )
+
+        if outside:
+            with st.expander(
+                f"{len(outside)} skills are beyond anything in the data"
+            ):
+                outside_table = pd.DataFrame(
+                    outside,
+                    columns=["Skill", "This group", "Historical limit",
+                             "Beyond by"],
+                ).sort_values("Beyond by", ascending=False)
+                st.dataframe(
+                    outside_table.round(2),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.caption(
+                    "Values are standard deviations vs. the league. The "
+                    "historical limit is the 1st/99th percentile of real "
+                    "top-five groups. The model is only shown values up "
+                    "to that limit."
+                )
 
         st.caption(
             "Predictions are relative to a league-average team. Read the "
@@ -1080,7 +1350,10 @@ def render_team_builder(df, player_labels, player_options):
             "combine."
         )
 
-        with st.expander("Lineup profile (z-scores vs. each player's season)"):
+        with st.expander(
+            "Lineup profile (z-scores vs. each player's season, after "
+            "sharing limits)"
+        ):
             profile_table = lineup_z.T.round(2)
             profile_table.columns = names
             profile_table["Lineup average"] = lineup.round(2)
