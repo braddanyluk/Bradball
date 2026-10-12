@@ -1724,6 +1724,656 @@ def render_team_builder(df, player_labels, player_options):
 
 
 # --------------------------------------------------
+# PAIR LAB HELPERS
+# --------------------------------------------------
+
+PAIR_FILE = Path(__file__).parent / "player_pair_seasons.csv.gz"
+
+PAIR_RATES = ["OffRtg", "DefRtg", "NetRtg"]
+PAIR_PCTS = ["Fg3Pct", "Fg2Pct", "OppFg3Pct", "OppFg2Pct"]
+
+# Small samples are pulled toward the team baseline: with this many
+# shared minutes, half of a pair's difference from baseline is kept.
+PAIR_SHRINK_MINUTES = 400
+
+PAIR_SAMPLE_LABELS = [
+    "⚪ No shared minutes",
+    "🔴 Very low (<50 min)",
+    "🟠 Low (50-199 min)",
+    "🟡 Moderate (200-499 min)",
+    "🟢 Solid (500+ min)",
+]
+
+
+def pair_sample_label(minutes):
+    """Evidence tier for a Series (or single number) of shared minutes."""
+    scalar = np.isscalar(minutes)
+    m = pd.to_numeric(pd.Series([minutes] if scalar else minutes), errors="coerce")
+    m = m.fillna(0)
+    labels = np.select(
+        [m <= 0, m < 50, m < 200, m < 500],
+        PAIR_SAMPLE_LABELS[:4],
+        default=PAIR_SAMPLE_LABELS[4],
+    )
+    return labels[0] if scalar else pd.Series(labels, index=m.index)
+
+
+def _clean_id(series):
+    return (
+        series.astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
+    )
+
+
+def _read_name_lookup():
+    """Same player_id -> name mapping the rest of the app uses."""
+    try:
+        names = pd.read_csv(NAME_FILE, low_memory=False)
+        names["player_id"] = _clean_id(names["player_id"])
+        names = names.dropna(subset=["player_id", "player"])
+        names["player"] = names["player"].astype(str).str.strip()
+        names = names[names["player"] != ""]
+        return names.drop_duplicates("player_id").set_index("player_id")["player"]
+    except Exception:
+        return pd.Series(dtype="string")
+
+
+@st.cache_data(show_spinner="Loading player-pair data...")
+def load_pairs():
+    """Load and clean the pair file. Returns (data, report).
+
+    Nothing here assumes the file is tidy: units and scales are detected,
+    and everything unusual is recorded in the report for the Data checks tab.
+    """
+    report = {"notes": [], "problems": []}
+
+    raw = pd.read_csv(
+        PAIR_FILE,
+        compression="gzip",
+        dtype={"Player1Id": "string", "Player2Id": "string", "TeamId": "string"},
+        low_memory=False,
+    )
+    raw.columns = [str(c).strip() for c in raw.columns]
+    report["rows_raw"] = len(raw)
+    report["columns"] = list(raw.columns)
+
+    required = ["Season", "Player1Id", "Player2Id", "Minutes"]
+    missing = [c for c in required if c not in raw.columns]
+    if missing:
+        report["problems"].append(f"Missing required columns: {', '.join(missing)}")
+        return None, report
+
+    d = raw.copy()
+    d["Player1Id"] = _clean_id(d["Player1Id"])
+    d["Player2Id"] = _clean_id(d["Player2Id"])
+    d["Season"] = d["Season"].astype("string").str.strip()
+
+    if "TeamId" in d.columns:
+        d["TeamId"] = _clean_id(d["TeamId"])
+    else:
+        d["TeamId"] = pd.NA
+        report["notes"].append("No TeamId column; teams are identified by name.")
+    if "Team" not in d.columns:
+        d["Team"] = d["TeamId"]
+        report["notes"].append("No Team column; using TeamId as the team label.")
+    d["Team"] = d["Team"].astype("string").str.strip()
+    if "SeasonType" not in d.columns:
+        d["SeasonType"] = "Regular Season"
+        report["notes"].append("No SeasonType column; assuming regular season.")
+    d["SeasonType"] = d["SeasonType"].astype("string").str.strip()
+
+    for column in ["Minutes"] + PAIR_RATES + PAIR_PCTS:
+        if column in d.columns:
+            d[column] = pd.to_numeric(d[column], errors="coerce")
+        else:
+            d[column] = np.nan
+            report["notes"].append(f"Column {column} not in file; left blank.")
+
+    # Drop rows we can't interpret as a pair of two different players.
+    bad = (
+        d["Player1Id"].isna() | d["Player2Id"].isna()
+        | (d["Player1Id"] == d["Player2Id"])
+        | d["Season"].isna() | d["Team"].isna()
+    )
+    report["unusable_rows"] = int(bad.sum())
+    d = d[~bad].copy()
+
+    # Minutes: detect seconds vs minutes.
+    positive = d.loc[d["Minutes"] > 0, "Minutes"]
+    if len(positive) and positive.quantile(0.99) > 5000:
+        d["Minutes"] = d["Minutes"] / 60
+        report["notes"].append(
+            "Minutes looked like seconds (99th percentile above 5,000), "
+            "so they were divided by 60."
+        )
+    elif len(positive):
+        report["notes"].append(
+            "Minutes treated as minutes "
+            f"(median {positive.median():.0f}, max {positive.max():.0f})."
+        )
+
+    # Zero-minute rows: their ratings are placeholders, not performance.
+    zero = d["Minutes"].fillna(0) <= 0
+    report["zero_minute_rows"] = int(zero.sum())
+    nonblank = d.loc[zero, PAIR_RATES + PAIR_PCTS].fillna(0).ne(0).any(axis=1)
+    report["zero_minute_with_values"] = int(nonblank.sum())
+    d.loc[zero, PAIR_RATES + PAIR_PCTS] = np.nan
+
+    # Net rating: fill in from offense and defense if needed; sanity check.
+    off_def = d["OffRtg"].notna() & d["DefRtg"].notna()
+    if d["NetRtg"].notna().sum() == 0 and off_def.any():
+        d["NetRtg"] = d["OffRtg"] - d["DefRtg"]
+        report["notes"].append("NetRtg was empty; computed as OffRtg - DefRtg.")
+    both = off_def & d["NetRtg"].notna()
+    if both.any():
+        mismatch = ((d.loc[both, "NetRtg"] - (d.loc[both, "OffRtg"] - d.loc[both, "DefRtg"])).abs() > 0.6).mean()
+        report["net_mismatch_share"] = float(mismatch)
+
+    # Shooting percentages: fractions or percents?
+    for column in PAIR_PCTS:
+        positive_pct = d.loc[d[column] > 0, column]
+        if len(positive_pct) and positive_pct.quantile(0.99) <= 1.5:
+            d[column] = d[column] * 100
+            report["notes"].append(f"{column} was a fraction (0-1); converted to percent.")
+        d.loc[d[column] > 100, column] = np.nan
+        # An exact 0% on a tiny sample almost always means "no attempts".
+        suspect = (d[column] == 0) & (d["Minutes"] < 100)
+        report[f"{column}_zero_blanked"] = int(suspect.sum())
+        d.loc[suspect, column] = np.nan
+
+    # One row per pair: put the two IDs in a fixed order, drop mirrors.
+    first, second = d["Player1Id"], d["Player2Id"]
+    swap = first > second
+    d["PlayerA"] = first.where(~swap, second).astype(str)
+    d["PlayerB"] = second.where(~swap, first).astype(str)
+    for column in ["Season", "Team", "SeasonType"]:
+        d[column] = d[column].astype(str)
+
+    team_key = "TeamId" if d["TeamId"].notna().any() else "Team"
+    keys = ["Season", "SeasonType", team_key, "PlayerA", "PlayerB"]
+    before = len(d)
+    d = d.sort_values("Minutes", ascending=False).drop_duplicates(keys)
+    report["duplicates_removed"] = before - len(d)
+
+    # Names, using the same mapping as the rest of the app.
+    lookup = _read_name_lookup()
+    d["NameA"] = d["PlayerA"].map(lookup)
+    d["NameB"] = d["PlayerB"].map(lookup)
+    report["name_coverage"] = float(
+        (d["NameA"].notna() & d["NameB"].notna()).mean()
+    ) if len(d) else 0.0
+    d["NameA"] = d["NameA"].fillna("Player " + d["PlayerA"])
+    d["NameB"] = d["NameB"].fillna("Player " + d["PlayerB"])
+
+    # Team baselines (minutes-weighted over that team's pairs).
+    group = ["Season", "SeasonType", "Team"]
+    valid = d["Minutes"] > 0
+    for rating, label in (("NetRtg", "BaseNet"), ("OffRtg", "BaseOff"), ("DefRtg", "BaseDef")):
+        ok = valid & d[rating].notna()
+        tmp = d.loc[ok, group + ["Minutes", rating]].copy()
+        tmp["_w"] = tmp[rating] * tmp["Minutes"]
+        agg = tmp.groupby(group).agg(_w=("_w", "sum"), _m=("Minutes", "sum"))
+        agg[label] = agg["_w"] / agg["_m"]
+        d = d.merge(agg[[label]].reset_index(), on=group, how="left")
+
+    d["NetVsTeam"] = d["NetRtg"] - d["BaseNet"]
+    d["Shrunk"] = d["NetVsTeam"] * d["Minutes"] / (d["Minutes"] + PAIR_SHRINK_MINUTES)
+    d["Sample"] = pair_sample_label(d["Minutes"])
+
+    d = d.reset_index(drop=True)
+    report["rows_clean"] = len(d)
+    return d, report
+
+
+def _weighted(group, column):
+    weights = group["Minutes"].clip(lower=0)
+    ok = group[column].notna() & (weights > 0)
+    if not ok.any() or weights[ok].sum() <= 0:
+        return np.nan
+    return float((group.loc[ok, column] * weights[ok]).sum() / weights[ok].sum())
+
+
+def pair_by_season(history):
+    """One row per season for a pair (minutes-weighted if traded mid-season)."""
+    rows = []
+    for season, group in history.groupby("Season"):
+        row = {
+            "Season": season,
+            "Team": ", ".join(sorted(group["Team"].unique())),
+            "Minutes": float(group["Minutes"].clip(lower=0).sum()),
+        }
+        for column in PAIR_RATES + PAIR_PCTS:
+            row[column] = _weighted(group, column)
+        rows.append(row)
+    table = pd.DataFrame(rows).sort_values("Season").reset_index(drop=True)
+    table["Sample"] = pair_sample_label(table["Minutes"])
+    return table
+
+
+def _pair_skill_context(df, pid_a, pid_b, name_a, name_b, season):
+    """Each player's skill profile (z-scores vs. that season's league)."""
+    zfeat, _, _ = builder_tables(df)
+    if zfeat.empty or "Season" not in df.columns:
+        return None
+
+    minutes = _minutes(df)
+    if name_a == name_b:
+        name_b = name_b + " (2)"
+
+    columns = {}
+    for pid, name in ((pid_a, name_a), (pid_b, name_b)):
+        rows = df.index[
+            (df["player_id"].astype(str) == pid)
+            & (df["Season"].astype(str) == season)
+        ]
+        if len(rows) == 0:
+            continue
+        best = minutes.loc[rows].idxmax() if minutes is not None else rows[0]
+        columns[name] = zfeat.loc[best]
+
+    if not columns:
+        return None
+    table = pd.DataFrame(columns)
+    if len(columns) == 2:
+        table["Pair average"] = table.mean(axis=1)
+    return table
+
+
+def _show_pair_metrics(row):
+    minutes = float(row["Minutes"])
+    st.markdown(f"**Evidence:** {row['Sample']}")
+
+    if minutes <= 0:
+        st.warning(
+            "This pair is listed but never shared the floor, so its ratings "
+            "are blank. A blank is not a zero: there's no performance to "
+            "report."
+        )
+        return
+
+    if minutes < 200:
+        st.warning(
+            f"Only {minutes:.0f} shared minutes. Ratings from samples this "
+            "small swing a lot, so treat them as noise unless other seasons "
+            "agree."
+        )
+
+    def number(value, fmt):
+        return "—" if pd.isna(value) else fmt.format(value)
+
+    def delta(value, base):
+        if pd.isna(value) or pd.isna(base):
+            return None
+        return f"{value - base:+.1f} vs team"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Shared minutes", f"{minutes:,.0f}")
+    c2.metric("Net rating", number(row["NetRtg"], "{:+.1f}"),
+              delta(row["NetRtg"], row["BaseNet"]))
+    c3.metric("Offensive rating", number(row["OffRtg"], "{:.1f}"),
+              delta(row["OffRtg"], row["BaseOff"]))
+    c4.metric("Defensive rating", number(row["DefRtg"], "{:.1f}"),
+              delta(row["DefRtg"], row["BaseDef"]), delta_color="inverse")
+
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("3P%", number(row["Fg3Pct"], "{:.1f}%"))
+    s2.metric("2P%", number(row["Fg2Pct"], "{:.1f}%"))
+    s3.metric("Opponent 3P%", number(row["OppFg3Pct"], "{:.1f}%"))
+    s4.metric("Opponent 2P%", number(row["OppFg2Pct"], "{:.1f}%"))
+
+    if pd.notna(row["NetVsTeam"]):
+        st.caption(
+            f"Net rating vs. the team's baseline: {row['NetVsTeam']:+.1f} raw, "
+            f"{row['Shrunk']:+.1f} after adjusting for sample size. "
+            "The baseline is the team's minutes-weighted average across all "
+            "its pairs that season."
+        )
+
+
+def _pair_lookup(pairs, df):
+    types = sorted(pairs["SeasonType"].unique())
+    default_type = types.index("Regular Season") if "Regular Season" in types else 0
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        season_type = st.selectbox("Season type", types, index=default_type, key="pair_type")
+    typed = pairs[pairs["SeasonType"] == season_type]
+
+    seasons = sorted(typed["Season"].unique(), reverse=True)
+    if not seasons:
+        st.info("No data for that season type.")
+        return
+    with c2:
+        season = st.selectbox("Season", seasons, key="pair_season")
+    in_season = typed[typed["Season"] == season]
+
+    teams = sorted(in_season["Team"].unique())
+    with c3:
+        team = st.selectbox("Team", teams, key="pair_team")
+    sub = in_season[in_season["Team"] == team]
+
+    # Players on this team-season, with unambiguous labels.
+    names = {**dict(zip(sub["PlayerA"], sub["NameA"])),
+             **dict(zip(sub["PlayerB"], sub["NameB"]))}
+    name_counts = pd.Series(list(names.values())).value_counts()
+    label_of = {
+        pid: (name if name_counts[name] == 1 else f"{name} ({pid})")
+        for pid, name in names.items()
+    }
+    player_ids = sorted(names, key=lambda p: label_of[p].lower())
+
+    p1_label = st.selectbox(
+        "First player (type to search)",
+        [label_of[p] for p in player_ids],
+        key=f"pair_p1_{season_type}_{season}_{team}",
+    )
+    p1 = next(p for p in player_ids if label_of[p] == p1_label)
+
+    # Partners with a record first (most shared minutes first), then the rest.
+    mine = sub[(sub["PlayerA"] == p1) | (sub["PlayerB"] == p1)].copy()
+    mine["Partner"] = np.where(mine["PlayerA"] == p1, mine["PlayerB"], mine["PlayerA"])
+    shared = mine.groupby("Partner")["Minutes"].sum().sort_values(ascending=False)
+
+    options, option_to_id = [], {}
+    for partner, minutes in shared.items():
+        text = (f"{label_of[partner]} · {minutes:.0f} min together"
+                if minutes > 0 else f"{label_of[partner]} · listed, 0 min")
+        options.append(text)
+        option_to_id[text] = partner
+    for pid in player_ids:
+        if pid != p1 and pid not in shared.index:
+            text = f"{label_of[pid]} · no shared record"
+            options.append(text)
+            option_to_id[text] = pid
+
+    if not options:
+        st.info("This player has no teammates in the data for that team-season.")
+        return
+
+    p2_text = st.selectbox(
+        "Second player (partners sorted by shared minutes)",
+        options,
+        key=f"pair_p2_{season_type}_{season}_{team}_{p1}",
+    )
+    p2 = option_to_id[p2_text]
+    lo, hi = sorted([p1, p2])
+
+    st.markdown(f"### {label_of[p1]} + {label_of[p2]}")
+    record = sub[(sub["PlayerA"] == lo) & (sub["PlayerB"] == hi)]
+
+    if record.empty:
+        st.info(
+            "No record for this pair with this team in this season. That "
+            "means they have no data together here (they likely never "
+            "shared the floor). It is not a rating of zero."
+        )
+    else:
+        _show_pair_metrics(record.iloc[0])
+
+    st.caption(
+        "These are descriptive numbers. Minutes, the other three players on "
+        "the floor, opponents and sample size all shape them, so they don't "
+        "prove two players make each other better."
+    )
+
+    # ---- Across seasons ----
+    st.markdown("#### This pair across seasons")
+    history = pairs[
+        (pairs["PlayerA"] == lo) & (pairs["PlayerB"] == hi)
+        & (pairs["SeasonType"] == season_type)
+    ]
+
+    if history.empty:
+        st.caption("This pair has no record in any season for this season type.")
+    else:
+        by_season = pair_by_season(history)
+        if len(by_season) < 2:
+            st.caption(
+                "Only one season on record for this pair, so there's no "
+                "trend to compare."
+            )
+        st.dataframe(
+            by_season[["Season", "Team", "Minutes", "Sample", "NetRtg", "OffRtg",
+                       "DefRtg", "Fg3Pct", "Fg2Pct", "OppFg3Pct", "OppFg2Pct"]]
+            .rename(columns={"NetRtg": "Net", "OffRtg": "Off", "DefRtg": "Def",
+                             "Fg3Pct": "3P%", "Fg2Pct": "2P%",
+                             "OppFg3Pct": "Opp 3P%", "OppFg2Pct": "Opp 2P%"})
+            .style.format({"Minutes": "{:.0f}", "Net": "{:+.1f}", "Off": "{:.1f}",
+                           "Def": "{:.1f}", "3P%": "{:.1f}", "2P%": "{:.1f}",
+                           "Opp 3P%": "{:.1f}", "Opp 2P%": "{:.1f}"}, na_rep="—"),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if len(by_season) >= 2:
+            floor = st.slider(
+                "Chart only seasons with at least this many shared minutes",
+                min_value=0, max_value=1000, value=100, step=25,
+                key="pair_chart_floor",
+            )
+            plotted = by_season[by_season["Minutes"] >= max(floor, 1)]
+            if len(plotted) >= 2:
+                chart = plotted.set_index("Season")[["NetRtg", "OffRtg", "DefRtg"]]
+                st.line_chart(chart, use_container_width=True)
+            else:
+                st.caption("Fewer than two seasons clear that minutes bar, so there's nothing to chart.")
+
+    # ---- Skill context ----
+    if st.checkbox("Show each player's skill profile for this season",
+                   value=False, key="pair_skills"):
+        try:
+            context = _pair_skill_context(
+                df, p1, p2, names[p1], names[p2], season
+            )
+        except Exception as error:
+            context = None
+            st.caption(f"Couldn't build skill profiles: {error}")
+        if context is None:
+            st.caption(
+                "No matching player-stat rows for those players in this "
+                "season, so no skill profile to show."
+            )
+        else:
+            st.dataframe(context.round(2), use_container_width=True)
+            st.caption(
+                "Standard deviations vs. the league that season (+1 is one "
+                "above average). Use it to ask what each player brings, "
+                "not as an explanation of the pair's rating."
+            )
+
+
+def _pair_explorer(pairs):
+    types = sorted(pairs["SeasonType"].unique())
+    default_type = types.index("Regular Season") if "Regular Season" in types else 0
+
+    f1, f2 = st.columns(2)
+    with f1:
+        season_type = st.selectbox("Season type", types, index=default_type, key="pe_type")
+    all_seasons = sorted(pairs.loc[pairs["SeasonType"] == season_type, "Season"].unique())
+    if not all_seasons:
+        st.info("No data for that season type.")
+        return
+    with f2:
+        if len(all_seasons) > 1:
+            start, end = st.select_slider(
+                "Seasons", options=all_seasons,
+                value=(all_seasons[0], all_seasons[-1]), key="pe_seasons",
+            )
+        else:
+            start = end = all_seasons[0]
+
+    g1, g2, g3 = st.columns(3)
+    with g1:
+        chosen_teams = st.multiselect("Teams (blank = all)", sorted(pairs["Team"].unique()), key="pe_teams")
+    with g2:
+        query = st.text_input("Player name contains", key="pe_query")
+    with g3:
+        min_minutes = st.slider("Minimum shared minutes", 0, 2000, 200, 25, key="pe_min")
+
+    sort_options = {
+        "Net vs team, sample-adjusted (recommended)": ("Shrunk", False),
+        "Net rating": ("NetRtg", False),
+        "Net vs team (raw)": ("NetVsTeam", False),
+        "Offensive rating": ("OffRtg", False),
+        "Defensive rating (lower is better)": ("DefRtg", True),
+        "Shared minutes": ("Minutes", False),
+        "3P%": ("Fg3Pct", False),
+        "2P%": ("Fg2Pct", False),
+        "Opponent 3P% (lower is better)": ("OppFg3Pct", True),
+        "Opponent 2P% (lower is better)": ("OppFg2Pct", True),
+    }
+    h1, h2, h3 = st.columns(3)
+    with h1:
+        sort_label = st.selectbox("Sort by", list(sort_options.keys()), key="pe_sort")
+    with h2:
+        direction = st.radio("Order", ["Best first", "Worst first"], horizontal=True, key="pe_dir")
+    with h3:
+        rows_to_show = st.select_slider("Rows to show", options=[25, 50, 100, 250], value=50, key="pe_rows")
+
+    f = pairs[
+        (pairs["SeasonType"] == season_type)
+        & pairs["Season"].between(start, end)
+        & (pairs["Minutes"] > 0)
+        & (pairs["Minutes"] >= min_minutes)
+    ]
+    if chosen_teams:
+        f = f[f["Team"].isin(chosen_teams)]
+    if query.strip():
+        q = query.strip()
+        f = f[
+            f["NameA"].str.contains(q, case=False, na=False, regex=False)
+            | f["NameB"].str.contains(q, case=False, na=False, regex=False)
+        ]
+
+    if f.empty:
+        st.info("No pairs match those filters. Try lowering the minimum minutes.")
+        return
+
+    column, best_is_low = sort_options[sort_label]
+    ascending = best_is_low if direction == "Best first" else not best_is_low
+    ranked = f.dropna(subset=[column]).sort_values(column, ascending=ascending)
+
+    st.caption(
+        f"{len(ranked):,} pair-seasons match. "
+        f"{(ranked['Minutes'] < 500).mean():.0%} of them have fewer than 500 shared minutes. "
+        "Pairs with no shared minutes are left out."
+    )
+
+    view = ranked.head(rows_to_show)[[
+        "NameA", "NameB", "Season", "Team", "Minutes", "Sample", "NetRtg",
+        "NetVsTeam", "Shrunk", "OffRtg", "DefRtg", "Fg3Pct", "Fg2Pct",
+        "OppFg3Pct", "OppFg2Pct",
+    ]].rename(columns={
+        "NameA": "Player 1", "NameB": "Player 2", "NetRtg": "Net",
+        "NetVsTeam": "Net vs team", "Shrunk": "Adjusted vs team",
+        "OffRtg": "Off", "DefRtg": "Def", "Fg3Pct": "3P%", "Fg2Pct": "2P%",
+        "OppFg3Pct": "Opp 3P%", "OppFg2Pct": "Opp 2P%",
+    })
+    st.dataframe(
+        view.style.format({
+            "Minutes": "{:.0f}", "Net": "{:+.1f}", "Net vs team": "{:+.1f}",
+            "Adjusted vs team": "{:+.1f}", "Off": "{:.1f}", "Def": "{:.1f}",
+            "3P%": "{:.1f}", "2P%": "{:.1f}", "Opp 3P%": "{:.1f}", "Opp 2P%": "{:.1f}",
+        }, na_rep="—"),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.caption(
+        "'Adjusted vs team' pulls small samples toward the team's baseline, "
+        "so a hot 80-minute pair doesn't outrank a proven 1,500-minute one. "
+        "Look for pairs that stay good across seasons and teammates."
+    )
+
+
+def _pair_checks(pairs, report):
+    st.write("What the pair file actually contains, and what was cleaned.")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Rows in file", f"{report['rows_raw']:,}")
+    m2.metric("Rows after cleaning", f"{report['rows_clean']:,}")
+    m3.metric("Seasons", f"{pairs['Season'].nunique()}")
+    m4.metric("Teams", f"{pairs['Team'].nunique()}")
+
+    n1, n2, n3, n4 = st.columns(4)
+    n1.metric("Zero-minute rows", f"{report['zero_minute_rows']:,}")
+    n2.metric("...that had non-zero values", f"{report['zero_minute_with_values']:,}",
+              help="These were blanked, not treated as performance.")
+    n3.metric("Mirror duplicates removed", f"{report['duplicates_removed']:,}")
+    n4.metric("Players with a known name", f"{report['name_coverage']:.0%}")
+
+    for problem in report["problems"]:
+        st.error(problem)
+    for note in report["notes"]:
+        st.caption(note)
+    if report.get("net_mismatch_share", 0) > 0.02:
+        st.warning(
+            f"{report['net_mismatch_share']:.0%} of rows have a NetRtg that "
+            "doesn't equal OffRtg minus DefRtg (beyond rounding). Worth a look."
+        )
+    blanked = {c: report.get(f"{c}_zero_blanked", 0) for c in PAIR_PCTS}
+    if any(blanked.values()):
+        st.caption(
+            "Exact 0% shooting on under 100 shared minutes was blanked as "
+            "'probably no attempts': "
+            + ", ".join(f"{c} {n:,}" for c, n in blanked.items())
+        )
+
+    st.markdown("#### Evidence tiers")
+    tiers = (pairs["Sample"].value_counts()
+             .reindex(PAIR_SAMPLE_LABELS).fillna(0).astype(int).rename("Pair-seasons"))
+    st.dataframe(tiers.reset_index().rename(columns={"index": "Tier", "Sample": "Tier"}),
+                 use_container_width=True, hide_index=True)
+
+    st.markdown("#### Coverage by season")
+    coverage = pairs.groupby(["SeasonType", "Season"]).agg(
+        Pairs=("Minutes", "size"),
+        Teams=("Team", "nunique"),
+        Median_minutes=("Minutes", "median"),
+    ).reset_index()
+    st.dataframe(coverage.round(1), use_container_width=True, hide_index=True)
+
+    st.markdown("#### Value ranges")
+    numeric = pairs[["Minutes"] + PAIR_RATES + PAIR_PCTS]
+    st.dataframe(numeric.describe().T.round(2), use_container_width=True)
+
+
+def render_pair_lab(df):
+    """Pair Lab: how two-player combinations have performed."""
+    st.subheader("Pair Lab")
+    st.write(
+        "How two-player combinations performed while sharing the floor. "
+        "Good for noticing things worth investigating, not for declaring "
+        "that two players make each other better."
+    )
+
+    if not PAIR_FILE.exists():
+        st.info(
+            "Pair data not found. Put `player_pair_seasons.csv.gz` in the "
+            "same folder as `app.py`."
+        )
+        return
+
+    try:
+        pairs, report = load_pairs()
+    except Exception as error:
+        st.error(f"Unable to load the pair data: {error}")
+        return
+
+    if pairs is None:
+        st.error("; ".join(report["problems"]))
+        return
+
+    look_tab, explore_tab, checks_tab = st.tabs(
+        ["Look up a pair", "Explore pairs", "Data checks"]
+    )
+    with look_tab:
+        _pair_lookup(pairs, df)
+    with explore_tab:
+        _pair_explorer(pairs)
+    with checks_tab:
+        _pair_checks(pairs, report)
+
+
+# --------------------------------------------------
 # HEADER
 # --------------------------------------------------
 
@@ -2148,13 +2798,13 @@ with lab_tab:
 
     st.write(
         "Hunt for patterns in the data. Pick a lab: the Player Lab "
-        "looks at what players do, and the Team Lab looks at how whole "
-        "teams play."
+        "looks at what players do, the Team Lab looks at how whole "
+        "teams play, and the Pair Lab looks at two-player combinations."
     )
 
     lab_choice = st.selectbox(
         "Choose a lab",
-        ["Player Lab", "Team Lab"],
+        ["Player Lab", "Team Lab", "Pair Lab"],
         key="lab_choice",
     )
 
@@ -2393,7 +3043,7 @@ with lab_tab:
                 )
 
 
-    else:
+    elif lab_choice == "Team Lab":
         st.subheader("Team Lab")
 
         st.write(
@@ -2568,6 +3218,9 @@ with lab_tab:
                     "per-100 and net rating numbers are approximate."
                 )
 
+
+    else:
+        render_pair_lab(df)
 
 # --------------------------------------------------
 # TEAM BUILDER
