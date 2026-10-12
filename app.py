@@ -1,3 +1,4 @@
+import html
 import re
 
 import numpy as np
@@ -128,6 +129,76 @@ st.markdown("""
         border-radius: 10px;
     }
 
+    .headshot {
+        position: relative;
+        flex: 0 0 auto;
+        overflow: hidden;
+        border-radius: 12px;
+        background: linear-gradient(160deg, #232A36 0%, #171B22 100%);
+        border: 1px solid #2A303B;
+        border-bottom: 3px solid #FF8A3D;
+    }
+
+    /* Shown when there is no picture, or while it loads. */
+    .headshot-initials {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 850;
+        letter-spacing: 2px;
+        color: #3A4352;
+    }
+
+    .headshot img {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        object-position: center bottom;
+    }
+
+    .player-card {
+        display: flex;
+        align-items: center;
+        gap: 22px;
+        background: #191E27;
+        border: 1px solid #2A303B;
+        border-radius: 14px;
+        padding: 14px 24px 14px 14px;
+        margin: 6px 0 16px 0;
+    }
+
+    .player-card-name {
+        font-size: clamp(24px, 4vw, 34px);
+        font-weight: 850;
+        letter-spacing: -1px;
+        line-height: 1.1;
+        color: #FFFFFF;
+    }
+
+    .player-card-sub {
+        font-size: 14px;
+        color: #D0D0D0;
+        margin-top: 6px;
+    }
+
+    .mini-player {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin: 4px 0 10px 0;
+    }
+
+    .mini-player-name {
+        font-weight: 700;
+        font-size: 14px;
+        color: #FFFFFF;
+        line-height: 1.2;
+    }
+
     .footer {
         border-top: 1px solid #2A303B;
         margin-top: 35px;
@@ -145,6 +216,91 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
+# --------------------------------------------------
+# PLAYER PICTURES
+# --------------------------------------------------
+
+HEADSHOT_URL = "https://cdn.nba.com/headshots/nba/latest/260x190/{player_id}.png"
+
+
+def headshot_url(player_id):
+    """NBA.com headshot for a stats.nba.com player ID, or None."""
+    text = str(player_id).strip()
+    if text.endswith(".0"):
+        text = text[:-2]
+    return HEADSHOT_URL.format(player_id=text) if text.isdigit() else None
+
+
+def name_initials(name):
+    parts = [p for p in re.split(r"[\s.\-]+", str(name)) if p]
+    letters = [p[0] for p in parts[:2]]
+    return "".join(letters).upper() or "?"
+
+
+def avatar_html(player_id, name, width=190):
+    """A headshot with an initials badge behind it.
+
+    If NBA.com has no picture for this player (or the link is blocked),
+    the image simply doesn't draw and the initials show instead.
+    """
+    height = round(width * 190 / 260)
+    url = headshot_url(player_id)
+    image = (
+        f'<img src="{url}" alt="" loading="lazy" '
+        f'referrerpolicy="no-referrer">'
+        if url else ""
+    )
+    return (
+        f'<div class="headshot" style="width:{width}px;height:{height}px;">'
+        f'<div class="headshot-initials" '
+        f'style="font-size:{round(width * 0.22)}px;">'
+        f'{html.escape(name_initials(name))}</div>{image}</div>'
+    )
+
+
+def player_card_html(player_id, name, subtitle=""):
+    return (
+        '<div class="player-card">'
+        + avatar_html(player_id, name, 190)
+        + '<div><div class="player-card-name">'
+        + html.escape(str(name))
+        + '</div><div class="player-card-sub">'
+        + html.escape(subtitle)
+        + "</div></div></div>"
+    )
+
+
+def mini_player_html(player_id, name, subtitle=""):
+    return (
+        '<div class="mini-player">'
+        + avatar_html(player_id, name, 84)
+        + '<div><div class="mini-player-name">'
+        + html.escape(str(name))
+        + '</div><div class="player-card-sub" style="margin-top:2px;">'
+        + html.escape(subtitle)
+        + "</div></div></div>"
+    )
+
+
+def career_summary(player_rows):
+    """'1998-99 to 2015-16 · 18 seasons · LAL, MIA' for a player."""
+    parts = []
+    if "Season" in player_rows.columns and len(player_rows):
+        seasons = player_rows["Season"].astype(str)
+        first, last = seasons.min(), seasons.max()
+        parts.append(first if first == last else f"{first} to {last}")
+        parts.append(f"{seasons.nunique()} seasons")
+    if "Tm" in player_rows.columns:
+        teams = [
+            t for t in player_rows["Tm"].astype(str).unique()
+            if not re.match(r"^(TOT|\dTM)$", t.upper()) and t != "nan"
+        ]
+        if teams:
+            shown = ", ".join(teams[:4])
+            parts.append(shown + ("..." if len(teams) > 4 else ""))
+    return " · ".join(parts)
+
 
 # --------------------------------------------------
 # DATA LOADING
@@ -680,6 +836,30 @@ POOL_DEFS = [
 ]
 
 
+# Capabilities where the best (or worst) player on the floor matters more
+# than the average: does anyone pass, shoot, protect the rim?
+ROLE_FEATURES = [
+    ("Best passer", "Assists /100", "max"),
+    ("Best 3-pt volume", "3-pt attempts /100", "max"),
+    ("Spacing floor (lowest 3-pt volume)", "3-pt attempts /100", "min"),
+    ("Best rim protector", "Blocks /100", "max"),
+    ("Best rim attacker", "Rim attempts /100", "max"),
+    ("Best rebounder", "Def. rebounds /100", "max"),
+]
+
+BUILDER_BOOTSTRAPS = 150
+
+
+def role_values(z_rows):
+    """Best or worst player on the floor for each capability (z-scores)."""
+    values = {}
+    for label, feature, how in ROLE_FEATURES:
+        if feature in z_rows.columns:
+            column = z_rows[feature]
+            values[label] = column.max() if how == "max" else column.min()
+    return pd.Series(values, dtype=float)
+
+
 def _player_feature_z(data):
     """Each player-season's stats, measured against that season's league.
 
@@ -744,6 +924,12 @@ def builder_tables(data):
     keys = [top["Season"], top["Tm"]]
 
     profile = z.loc[top.index].groupby(keys).mean()
+
+    zt = z.loc[top.index]
+    for label, feature, how in ROLE_FEATURES:
+        if feature in zt.columns:
+            grouped = zt[feature].groupby(keys)
+            profile[label] = grouped.max() if how == "max" else grouped.min()
     profile["Core five"] = top.groupby(["Season", "Tm"])["player_name"].agg(
         lambda s: ", ".join(s.astype(str))
     )
@@ -856,6 +1042,13 @@ def _ridge_predict(model, X):
     return ((X - mu) / sd) @ coef + y_mean
 
 
+def _boot_predict(boot, X):
+    """Predictions from every bootstrap model for one lineup (1 x p)."""
+    return (
+        ((X - boot["mu"]) / boot["sd"]) * boot["coef"]
+    ).sum(axis=1) + boot["ym"]
+
+
 @st.cache_data(show_spinner="Fitting the model across seasons...")
 def fit_builder_models(profiles, feature_cols, target_col):
     """Fit additive and interaction models, scored on unseen seasons.
@@ -894,7 +1087,24 @@ def fit_builder_models(profiles, feature_cols, target_col):
         sse, alpha, oof = best
         model = _ridge_fit(X, y, alpha)
 
+        # Refit on resampled history. When a lineup is unlike anything in
+        # the data, these refits disagree with each other, and that
+        # disagreement is the model's honest measure of what it doesn't know.
+        rng = np.random.default_rng(0)
+        fits = [
+            _ridge_fit(X[idx], y[idx], alpha)
+            for idx in (rng.integers(0, len(y), len(y))
+                        for _ in range(BUILDER_BOOTSTRAPS))
+        ]
+        boot = {
+            "mu": np.array([f[0] for f in fits]),
+            "sd": np.array([f[1] for f in fits]),
+            "ym": np.array([f[2] for f in fits]),
+            "coef": np.array([f[3] for f in fits]),
+        }
+
         results[name] = {
+            "boot": boot,
             "alpha": alpha,
             "r2": 1 - sse / total_ss,
             "rmse": float(np.sqrt(sse / len(y))),
@@ -955,10 +1165,14 @@ def render_team_builder(df, player_labels, player_options):
             "assists and rebounds. If five players together would use more "
             "than any real top five ever has, everyone's share is scaled "
             "down to fit.\n"
-            "- **Guardrails:** if a lineup is more extreme than any real "
-            "team, the model is only shown values it has seen, the "
-            "prediction is shrunk toward average, and the error range is "
-            "hidden, because the model can't know what happens there.\n"
+            "- **Roles, not just averages:** the model also sees the best "
+            "passer, best rim protector, best shooter volume and the "
+            "'spacing floor' on the floor. That lets it learn the cost of "
+            "lacking a capability from real teams that lacked it.\n"
+            "- **Unusual lineups:** by default the model extrapolates and "
+            "shows a range that widens when a group is unlike history. "
+            "'Strict' mode instead caps results at the best and worst real "
+            "teams.\n"
             "- **Blind spots:** defense is only visible through steals, "
             "blocks and rebounds. Coaching, injuries, bench depth and "
             "opponent quality aren't in the model. On/off data will help "
@@ -978,7 +1192,11 @@ def render_team_builder(df, player_labels, player_options):
         )
         return
 
-    feature_cols = list(zfeat.columns)
+    base_cols = list(zfeat.columns)
+    feature_cols = [
+        c for c in profiles.columns
+        if c not in ("Season", "Tm", "Core five")
+    ]
 
     # ---- Targets ----
     targets = {}
@@ -1090,6 +1308,30 @@ def render_team_builder(df, player_labels, player_options):
     chosen_key = "additive" if model_choice == "Sum of parts" else "interact"
     chosen = results[chosen_key]
 
+    mode_col1, mode_col2 = st.columns(2)
+    with mode_col1:
+        guardrail_mode = st.radio(
+            "Unusual lineups",
+            ["Extrapolate and show the uncertainty",
+             "Strict: cap at the best and worst real teams"],
+            index=0,
+            key="builder_guardrails",
+            help="The first option lets the model say a group beats every "
+                 "real team, with a range showing how unsure it is. The "
+                 "second keeps results inside what has actually happened.",
+        )
+    with mode_col2:
+        limit_pools = st.checkbox(
+            "Apply shared-resource limits",
+            value=True,
+            key="builder_pools",
+            help="Five players can't all keep their full share of the "
+                 "shots, assists and rebounds. This scales shares down "
+                 "when the group wants more than any real top five has "
+                 "ever used.",
+        )
+    strict = guardrail_mode.startswith("Strict")
+
     # ---- Pick five players ----
     st.markdown("#### Pick five players")
 
@@ -1111,6 +1353,15 @@ def render_team_builder(df, player_labels, player_options):
 
             player_id = player_options[player_label]
             rows = df[df["player_id"] == player_id].sort_values("Season")
+
+            st.markdown(
+                mini_player_html(
+                    player_id,
+                    rows["player_name"].iloc[0],
+                    career_summary(rows),
+                ),
+                unsafe_allow_html=True,
+            )
 
             row_labels = {}
             for idx, row in rows.iterrows():
@@ -1138,12 +1389,19 @@ def render_team_builder(df, player_labels, player_options):
     elif len(set(selected_rows)) < 5:
         st.warning("The same player-season appears more than once.")
     else:
-        lineup_z, pool_report = apply_pool_limits(
-            df, zfeat, pools, selected_rows, feature_cols
-        )
-        lineup = lineup_z.mean(axis=0)
-        support = results["support"]
+        if limit_pools:
+            lineup_z, pool_report = apply_pool_limits(
+                df, zfeat, pools, selected_rows, base_cols
+            )
+        else:
+            lineup_z, pool_report = zfeat.loc[selected_rows, base_cols], []
 
+        lineup = (
+            pd.concat([lineup_z.mean(axis=0), role_values(lineup_z)])
+            .reindex(feature_cols)
+            .fillna(0)
+        )
+        support = results["support"]
         raw_vec = lineup.to_numpy(float)
 
         # How far is this group from anything that ever actually played?
@@ -1152,8 +1410,14 @@ def render_team_builder(df, player_labels, player_options):
         unusual_pct = float((support["d2"] < lineup_d2).mean() * 100)
         beyond_history = lineup_d2 > float(support["d2"].max())
 
-        # Guardrail 1: the model may only be fed values it has seen before.
-        clipped_vec = np.clip(raw_vec, support["lo"], support["hi"])
+        # Products of extreme values explode, so for the most unusual
+        # lineups fall back to the sum-of-parts model.
+        active_key, active = chosen_key, chosen
+        interactions_disabled = False
+        if active_key == "interact" and unusual_pct >= 99:
+            active_key, active = "additive", results["additive"]
+            interactions_disabled = True
+
         outside = []
         for i, feature in enumerate(feature_cols):
             if raw_vec[i] > support["hi"][i] + 1e-9:
@@ -1166,34 +1430,45 @@ def render_team_builder(df, player_labels, player_options):
         def model_output(vector):
             row = _design(
                 pd.DataFrame([vector], columns=feature_cols),
-                chosen_key == "interact",
-            )[chosen["columns"]]
+                active_key == "interact",
+            )[active["columns"]]
             values = row.to_numpy(float)
-            return values, float(_ridge_predict(chosen["model"], values)[0])
+            return values, float(_ridge_predict(active["model"], values)[0])
 
-        X, clipped_prediction = model_output(clipped_vec)
-        _, unadjusted_prediction = model_output(raw_vec)
-
-        # Guardrail 2: far outside all history, shrink toward average.
-        trust = 1.0
-        if beyond_history:
-            trust = float(np.sqrt(support["d2"].max() / lineup_d2))
-        prediction = clipped_prediction * trust
-
-        # Guardrail 3: don't claim more than the best team in the data.
         best_seen = float(results["data"]["actual"].max())
         worst_seen = float(results["data"]["actual"].min())
-        capped_by_history = False
-        model_number = prediction
-        if prediction > best_seen:
-            prediction, capped_by_history = best_seen, True
-        elif prediction < worst_seen:
-            prediction, capped_by_history = worst_seen, True
+        _, unadjusted_prediction = model_output(raw_vec)
 
-        model_mu, model_sd, _, coef = chosen["model"]
+        trust = 1.0
+        capped_by_history = False
+
+        if strict:
+            # Keep inputs inside history, shrink if far outside, and cap.
+            X, prediction = model_output(
+                np.clip(raw_vec, support["lo"], support["hi"])
+            )
+            if beyond_history:
+                trust = float(np.sqrt(support["d2"].max() / lineup_d2))
+            prediction *= trust
+            if prediction > best_seen:
+                prediction, capped_by_history = best_seen, True
+            elif prediction < worst_seen:
+                prediction, capped_by_history = worst_seen, True
+        else:
+            X, prediction = model_output(raw_vec)
+
+        # Uncertainty: resampled-history models disagree more the further
+        # the lineup is from anything real. Add ordinary prediction noise.
+        boot_predictions = _boot_predict(active["boot"], X)
+        boot_spread = float(boot_predictions.std())
+        total_spread = float(np.sqrt(boot_spread ** 2 + active["rmse"] ** 2))
+        low = prediction - 1.28 * total_spread
+        high = prediction + 1.28 * total_spread
+
+        model_mu, model_sd, _, coef = active["model"]
         contributions = pd.Series(
             ((X[0] - model_mu) / model_sd) * coef * trust,
-            index=chosen["columns"],
+            index=active["columns"],
         )
 
         if beyond_history:
@@ -1214,17 +1489,30 @@ def render_team_builder(df, player_labels, player_options):
             help="Relative to an average team of the same season.",
         )
         r2.metric(
-            "Typical error",
-            "Unknown"
-            if (beyond_history or capped_by_history)
-            else f"±{chosen['rmse']:.1f}",
-            help="Only meaningful for lineups resembling real teams.",
+            "Likely range (80%)",
+            "Capped" if capped_by_history else f"{low:+.1f} to {high:+.1f}",
+            help="Combines ordinary prediction error with how much the "
+                 "model's own estimates wobble for a lineup like this. A "
+                 "wide range means the model doesn't know.",
         )
         r3.metric(
             "How unusual is this group?",
             unusual_label,
             help=f"More unusual than {unusual_pct:.0f}% of real "
                  "historical cores.",
+        )
+
+        if interactions_disabled:
+            st.caption(
+                "Interaction terms were switched off for this lineup. "
+                "They multiply skills together, and for a group this "
+                "extreme those products explode, so the sum-of-parts "
+                "model was used instead."
+            )
+
+        st.caption(
+            f"For scale: the best real team in the data was "
+            f"{best_seen:+.1f} and the worst was {worst_seen:+.1f}."
         )
 
         scaled_any = any(r["Everyone scaled to"] < 0.98 for r in pool_report)
@@ -1255,7 +1543,7 @@ def render_team_builder(df, player_labels, player_options):
                 "probably generous: real players usually shoot a bit "
                 "worse when asked to do more."
             )
-        else:
+        elif pool_report:
             with st.expander("Shared resources (nothing needed scaling)"):
                 st.dataframe(
                     pd.DataFrame(pool_report).style.format({
@@ -1268,22 +1556,27 @@ def render_team_builder(df, player_labels, player_options):
                     hide_index=True,
                 )
 
-        if capped_by_history:
+        if strict and capped_by_history:
             st.warning(
-                f"The model's number was {model_number:+.1f}, which is "
-                f"beyond any real team in the data (best: {best_seen:+.1f}, "
-                f"worst: {worst_seen:+.1f}). It's shown capped. Read it as "
-                "'at least as good as the best team ever recorded, by "
-                "this model's reckoning,' not as a forecast."
+                "Strict mode: the model's number went beyond every real "
+                f"team in the data (best: {best_seen:+.1f}, worst: "
+                f"{worst_seen:+.1f}), so it is shown capped. Switch to "
+                "'Extrapolate' to see the uncapped estimate and its range."
             )
-
-        if beyond_history:
-            st.error(
-                "This group is unlike anything in the data. Real teams "
-                "never had five players like this, so the model has "
-                "nothing to learn from here. The number above has been "
-                "held back toward average, and it should be read as "
-                "'unknown', not as a prediction."
+        elif not strict and beyond_history:
+            st.info(
+                "No group in the data looks like this one, so the model is "
+                "extrapolating. It can still be useful here because it "
+                "builds the answer from capabilities that real teams did "
+                "or didn't have, but the range above is the honest answer, "
+                "not the single number. A wide range means 'unknown', not "
+                "'bad'."
+            )
+        elif not strict and prediction > best_seen:
+            st.info(
+                f"This beats the best real team in the data "
+                f"({best_seen:+.1f}). Check the range and the drivers "
+                "below before trusting it."
             )
         elif unusual_pct >= 99:
             st.warning(
@@ -1291,19 +1584,19 @@ def render_team_builder(df, player_labels, player_options):
                 "cores. Treat the prediction as shaky."
             )
 
-        if outside or abs(unadjusted_prediction - prediction) > 0.05:
+        if strict and (outside or abs(unadjusted_prediction - prediction) > 0.05):
             st.caption(
                 f"Raw model output was {unadjusted_prediction:+.1f}. "
-                f"Guardrails limited it to {prediction:+.1f}."
+                f"Strict mode limited it to {prediction:+.1f}."
             )
 
         if outside:
             with st.expander(
-                f"{len(outside)} skills are beyond anything in the data"
+                f"{len(outside)} measures are beyond anything in the data"
             ):
                 outside_table = pd.DataFrame(
                     outside,
-                    columns=["Skill", "This group", "Historical limit",
+                    columns=["Measure", "This group", "Historical limit",
                              "Beyond by"],
                 ).sort_values("Beyond by", ascending=False)
                 st.dataframe(
@@ -1314,15 +1607,11 @@ def render_team_builder(df, player_labels, player_options):
                 st.caption(
                     "Values are standard deviations vs. the league. The "
                     "historical limit is the 1st/99th percentile of real "
-                    "top-five groups. The model is only shown values up "
-                    "to that limit."
+                    "top-five groups. "
+                    + ("Strict mode only shows the model values up to that "
+                       "limit." if strict else
+                       "These values are passed to the model as they are.")
                 )
-
-        st.caption(
-            "Predictions are relative to a league-average team. Read the "
-            "error range as 'about two-thirds of the time, reality lands "
-            "within this of the prediction.'"
-        )
 
         names = []
         for idx in selected_rows:
@@ -1565,7 +1854,14 @@ with players_tab:
     if "Season" in player_df.columns:
         player_df = player_df.sort_values("Season")
 
-    st.markdown(f"### {player_df['player_name'].iloc[0]}")
+    st.markdown(
+        player_card_html(
+            selected_id,
+            player_df["player_name"].iloc[0],
+            career_summary(player_df),
+        ),
+        unsafe_allow_html=True,
+    )
 
     metric_columns = st.columns(3)
 
@@ -1809,7 +2105,14 @@ with compare_tab:
     first_name, second_name = st.columns(2)
 
     with first_name:
-        st.markdown(f"#### {first_df['player_name'].iloc[0]}")
+        st.markdown(
+            player_card_html(
+                first_id,
+                first_df["player_name"].iloc[0],
+                career_summary(first_df),
+            ),
+            unsafe_allow_html=True,
+        )
         st.dataframe(
             first_df[first_cols],
             use_container_width=True,
@@ -1817,7 +2120,14 @@ with compare_tab:
         )
 
     with second_name:
-        st.markdown(f"#### {second_df['player_name'].iloc[0]}")
+        st.markdown(
+            player_card_html(
+                second_id,
+                second_df["player_name"].iloc[0],
+                career_summary(second_df),
+            ),
+            unsafe_allow_html=True,
+        )
         st.dataframe(
             second_df[second_cols],
             use_container_width=True,
