@@ -1150,11 +1150,10 @@ def render_team_builder(df, player_labels, player_options):
     st.header("Build a lineup")
 
     st.write(
-        "Pick five players and the tool predicts how that group would "
-        "have performed, using what has actually separated good teams from "
-        "bad ones historically. Nothing here is a hand-written rule: the "
-        "model learns what matters from team results, and then tells you "
-        "how well it can do that."
+        "Pick five players and the tool estimates how that group would "
+        "perform with all five on the floor together. Nothing here is a "
+        "hand-written rule: the model learns what matters from history, "
+        "and then tells you how well it can do that."
     )
 
     with st.expander("How this works, and what it can't see"):
@@ -1385,6 +1384,64 @@ def render_team_builder(df, player_labels, player_options):
             "effect would be counted twice."
         )
 
+    # ---- Calibration: is the model too cautious? ----
+    cal = calibration_summary(results["data"]["actual"], chosen["oof"])
+    with st.expander("Is the model too cautious? (calibration check)"):
+        if np.isnan(cal["slope"]):
+            st.write("Not enough data to check.")
+        else:
+            st.write(
+                f"On seasons it never saw, when the model predicted +1.0, "
+                f"teams actually averaged {cal['slope']:+.2f}."
+            )
+            st.dataframe(
+                cal["table"].style.format(
+                    {"Predicted": "{:+.1f}", "Actual": "{:+.1f}", "Teams": "{:.0f}"}
+                ),
+                use_container_width=True,
+            )
+            if cal["slope"] >= 1.15:
+                st.info(
+                    "Predictions look compressed: the best-looking teams did "
+                    "better than predicted and the worst did worse. That's "
+                    "typical of a cautious model, and 'Stretch predictions' "
+                    "below corrects for it."
+                )
+            elif cal["slope"] <= 0.9:
+                st.info(
+                    "Predictions look too bold: real results were less "
+                    "extreme than predicted. Stretching would make that worse."
+                )
+            else:
+                st.success("Predictions line up well with what happened.")
+
+    calibrate = st.checkbox(
+        "Stretch predictions to match history",
+        value=False,
+        key="builder_calibrate",
+        help="Applies the calibration slope above to the skills "
+             "prediction. Only worth turning on if the check shows "
+             "predictions are compressed.",
+    )
+
+    # The model learns from whole teams, whose benches dilute the five best
+    # players. A lineup is the five on the floor together, so that dilution
+    # is divided back out.
+    core_share = top_five_minute_share(df)
+    basis_scale = (1.0 / core_share) if core_share else 1.0
+    calib_scale = cal["scale"] if (calibrate and not np.isnan(cal["slope"])) else 1.0
+    st.caption(
+        f"Ratings are for these five on the floor together. The model "
+        f"learns from whole teams, where the top five play about "
+        f"{core_share:.0%} of the minutes, so the bench's dilution is "
+        f"divided out ({basis_scale:.2f}x). That's an estimate until "
+        "five-man lineup data replaces it."
+        if core_share else
+        "Ratings are for these five on the floor together. The bench's "
+        "dilution couldn't be estimated from this data, so none is "
+        "removed."
+    )
+
     mode_col1, mode_col2 = st.columns(2)
     with mode_col1:
         guardrail_mode = st.radio(
@@ -1535,7 +1592,7 @@ def render_team_builder(df, player_labels, player_options):
             )
             if beyond_history:
                 trust = float(np.sqrt(support["d2"].max() / lineup_d2))
-            prediction *= trust
+            prediction *= trust * calib_scale
             prediction += synergy_effect
             if prediction > best_seen:
                 prediction, capped_by_history = best_seen, True
@@ -1543,7 +1600,12 @@ def render_team_builder(df, player_labels, player_options):
                 prediction, capped_by_history = worst_seen, True
         else:
             X, prediction = model_output(raw_vec)
+            prediction *= calib_scale
             prediction += synergy_effect
+
+        # Everything above is on the model's native, whole-team basis.
+        prediction_team = prediction
+        prediction = prediction_team * basis_scale
 
         # Uncertainty: resampled-history models disagree more the further
         # the lineup is from anything real. Add ordinary prediction noise.
@@ -1555,16 +1617,17 @@ def render_team_builder(df, player_labels, player_options):
             else active["rmse"]
         )
         total_spread = float(np.sqrt(boot_spread ** 2 + error_used ** 2))
+        total_spread *= basis_scale * max(1.0, calib_scale)
         low = prediction - 1.28 * total_spread
         high = prediction + 1.28 * total_spread
 
         model_mu, model_sd, _, coef = active["model"]
         contributions = pd.Series(
-            ((X[0] - model_mu) / model_sd) * coef * trust,
+            ((X[0] - model_mu) / model_sd) * coef * trust * calib_scale * basis_scale,
             index=active["columns"],
         )
         if use_pair_layer:
-            contributions["Pair chemistry (10 pairs)"] = synergy_effect
+            contributions["Pair chemistry (10 pairs)"] = synergy_effect * basis_scale
 
         if beyond_history:
             unusual_label = "Unlike any in history"
@@ -1581,7 +1644,8 @@ def render_team_builder(df, player_labels, player_options):
         r1.metric(
             f"Predicted {target_label.split(' (')[0].lower()}",
             f"{prediction:+.1f} per 100",
-            help="Relative to an average team of the same season.",
+            help="These five on the floor together, relative to an "
+                 "average team of the same season.",
         )
         r2.metric(
             "Likely range (80%)",
@@ -1606,8 +1670,9 @@ def render_team_builder(df, player_labels, player_options):
             )
 
         st.caption(
-            f"For scale: the best real team in the data was "
-            f"{best_seen:+.1f} and the worst was {worst_seen:+.1f}."
+            f"For scale: the best real team in the data works out to "
+            f"{best_seen * basis_scale:+.1f} on a five-on-the-floor basis, "
+            f"and the worst to {worst_seen * basis_scale:+.1f}."
         )
 
         scaled_any = any(r["Everyone scaled to"] < 0.98 for r in pool_report)
@@ -1667,7 +1732,7 @@ def render_team_builder(df, player_labels, player_options):
                 "not the single number. A wide range means 'unknown', not "
                 "'bad'."
             )
-        elif not strict and prediction > best_seen:
+        elif not strict and prediction_team > best_seen:
             st.info(
                 f"This beats the best real team in the data "
                 f"({best_seen:+.1f}). Check the range and the drivers "
@@ -1747,6 +1812,94 @@ def render_team_builder(df, player_labels, player_options):
                 f"{pair_layer['backtest']['lam']:.2f} to {synergy_effect:+.2f} "
                 "per 100 in the prediction."
             )
+
+        # ---- How this number was built ----
+        def model_for(key, vector):
+            info = results[key]
+            row = _design(
+                pd.DataFrame([vector], columns=feature_cols), key == "interact"
+            )[info["columns"]]
+            return float(_ridge_predict(info["model"], row.to_numpy(float))[0])
+
+        unscaled_z = zfeat.loc[selected_rows, base_cols]
+        vec_unscaled = (
+            pd.concat([unscaled_z.mean(axis=0), role_values(unscaled_z)])
+            .reindex(feature_cols).fillna(0).to_numpy(float)
+        )
+        skills_only = model_for("additive", vec_unscaled)
+        active_unscaled = model_for(active_key, vec_unscaled)
+        active_limited = model_for(active_key, raw_vec)
+
+        stage_rows = [
+            ("Individual skills (sum of parts)", skills_only,
+             "What the five can do, added up, vs. an average team."),
+            ("Skill interactions", active_unscaled - skills_only,
+             "Credit or penalty for how the skills combine."),
+            ("Not enough to go around", active_limited - active_unscaled,
+             "Shots, assists and rebounds trimmed where the five want more "
+             "than any real top five has used."),
+            ("Stretching to match history", (calib_scale - 1.0) * active_limited,
+             "Calibration correction, if switched on."),
+            ("Pair chemistry", synergy_effect,
+             "How the ten pairs' skills fit, if switched on."),
+        ]
+        stage_rows.append((
+            "Guardrails", prediction_team - sum(v for _, v, _ in stage_rows),
+            "Strict-mode clipping, shrinking or capping, if any."
+        ))
+        stage_rows.append((
+            "Bench dilution removed", prediction - prediction_team,
+            "Converts a whole-team result into five players on the floor "
+            "together."
+        ))
+
+        steps = pd.DataFrame(stage_rows, columns=["Step", "Effect", "What it means"])
+        steps = steps[(steps["Effect"].abs() >= 0.005) | (steps.index == 0)].copy()
+        steps["Running total"] = steps["Effect"].cumsum()
+
+        st.markdown("#### How this number was built")
+        st.dataframe(
+            steps[["Step", "Effect", "Running total", "What it means"]]
+            .style.format({"Effect": "{:+.2f}", "Running total": "{:+.2f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.bar_chart(steps.set_index("Step")["Effect"], use_container_width=True)
+        st.caption(
+            f"Starts at a league-average team (0) and ends at the "
+            f"prediction ({prediction:+.2f})."
+        )
+
+        player_effects = []
+        for k in range(5):
+            swapped = lineup_z.copy()
+            swapped.iloc[k] = 0.0     # a league-average player in his place
+            vec = (
+                pd.concat([swapped.mean(axis=0), role_values(swapped)])
+                .reindex(feature_cols).fillna(0).to_numpy(float)
+            )
+            player_effects.append(
+                (model_for(active_key, raw_vec) - model_for(active_key, vec))
+                * calib_scale * basis_scale
+            )
+
+        contribution_table = pd.DataFrame({
+            "Player": names,
+            "Contribution (skills only)": player_effects,
+        }).sort_values("Contribution (skills only)", ascending=False)
+        st.markdown("#### Each player's contribution")
+        st.dataframe(
+            contribution_table.style.format({"Contribution (skills only)": "{:+.2f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            "How much each player adds compared with swapping in a "
+            "league-average player and leaving the other four alone. These "
+            "won't add up exactly to the total, because skills interact and "
+            "the five share the same shots and rebounds. Pair chemistry is "
+            "shown separately."
+        )
 
         st.markdown("#### What drives this prediction")
 
@@ -2950,6 +3103,68 @@ def _pair_skill_combos(pairs, data):
         "other has Y' means either player may hold either skill. These are "
         "patterns in past data, not guarantees."
     )
+
+
+# --------------------------------------------------
+# BUILDER TRANSPARENCY HELPERS
+# --------------------------------------------------
+
+def top_five_minute_share(data):
+    """Typical share of a team's player-minutes taken by its five busiest players.
+
+    The Builder learns from team results, and the bench plays the rest of the
+    minutes. So a team built around five players is diluted by its bench in a
+    way a five-man unit (all five on the floor together) is not.
+    """
+    minutes = _minutes(data)
+    if minutes is None or "Tm" not in data.columns or "Season" not in data.columns:
+        return None
+
+    d = pd.DataFrame({
+        "Season": data["Season"].astype(str),
+        "Tm": data["Tm"].astype(str),
+        "m": minutes,
+    }).dropna()
+    d = d[~d["Tm"].str.upper().str.match(r"^(TOT|\dTM)$") & (d["m"] > 0)]
+    if d.empty:
+        return None
+
+    groups = d.groupby(["Season", "Tm"])
+    d["rank"] = groups["m"].rank(ascending=False, method="first")
+    top = d[d["rank"] <= 5].groupby(["Season", "Tm"])["m"].sum()
+    total = groups["m"].sum()
+    count = groups["m"].size()
+
+    share = (top / total)[count >= 8].dropna()
+    if len(share) < 10:
+        return None
+    return float(np.clip(share.median(), 0.45, 0.95))
+
+
+def calibration_summary(actual, predicted):
+    """Does the model's out-of-sample prediction run too cautious or too bold?"""
+    actual = np.asarray(actual, float)
+    predicted = np.asarray(predicted, float)
+    ok = ~(np.isnan(actual) | np.isnan(predicted))
+    actual, predicted = actual[ok], predicted[ok]
+
+    out = {"slope": float("nan"), "scale": 1.0, "table": pd.DataFrame()}
+    if len(actual) < 50 or np.var(predicted) == 0:
+        return out
+
+    slope = float(np.cov(predicted, actual)[0, 1] / np.var(predicted, ddof=1))
+    out["slope"] = slope
+    out["scale"] = float(np.clip(slope, 0.8, 1.6))
+
+    bins = pd.qcut(predicted, 5, duplicates="drop")
+    table = pd.DataFrame({"bin": bins, "p": predicted, "a": actual})
+    table = table.groupby("bin", observed=True).agg(
+        Predicted=("p", "mean"), Actual=("a", "mean"), Teams=("p", "size")
+    ).reset_index(drop=True)
+    table.index = [f"Group {i + 1}" + (" (lowest)" if i == 0 else " (highest)" if i == len(table) - 1 else "")
+                   for i in range(len(table))]
+    out["table"] = table
+    return out
 
 
 # --------------------------------------------------
