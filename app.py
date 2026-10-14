@@ -1032,14 +1032,29 @@ def _design(features, interactions):
     )
 
 
-def _ridge_fit(X, y, alpha):
-    mu = X.mean(axis=0)
-    sd = X.std(axis=0)
+def _ridge_fit(X, y, alpha, w=None):
+    if w is None:
+        mu = X.mean(axis=0)
+        sd = X.std(axis=0)
+        sd[sd == 0] = 1.0
+        Z = (X - mu) / sd
+        y_mean = y.mean()
+        coef = np.linalg.solve(
+            Z.T @ Z + alpha * np.eye(Z.shape[1]), Z.T @ (y - y_mean)
+        )
+        return mu, sd, y_mean, coef
+
+    # Weighted version: rows with more minutes count for more.
+    w = w / w.mean()
+    total = w.sum()
+    mu = (X * w[:, None]).sum(axis=0) / total
+    sd = np.sqrt((w[:, None] * (X - mu) ** 2).sum(axis=0) / total)
     sd[sd == 0] = 1.0
     Z = (X - mu) / sd
-    y_mean = y.mean()
+    y_mean = float((w * y).sum() / total)
     coef = np.linalg.solve(
-        Z.T @ Z + alpha * np.eye(Z.shape[1]), Z.T @ (y - y_mean)
+        Z.T @ (Z * w[:, None]) + alpha * np.eye(Z.shape[1]),
+        Z.T @ (w * (y - y_mean)),
     )
     return mu, sd, y_mean, coef
 
@@ -1056,16 +1071,114 @@ def _boot_predict(boot, X):
     ).sum(axis=1) + boot["ym"]
 
 
+def _weighted_percentile(values, weights, q):
+    order = np.argsort(values)
+    v, w = values[order], weights[order]
+    cumulative = (np.cumsum(w) - 0.5 * w) / w.sum()
+    return float(np.interp(q / 100.0, cumulative, v))
+
+
+def _season_stats(X, y, w, season_index, n_seasons):
+    """Per-season sums needed to fit a weighted ridge without revisiting rows."""
+    p = X.shape[1]
+    S0 = np.zeros(n_seasons)
+    S1 = np.zeros((n_seasons, p))
+    S2 = np.zeros((n_seasons, p, p))
+    T1 = np.zeros(n_seasons)
+    T2 = np.zeros((n_seasons, p))
+    for s in range(n_seasons):
+        rows = season_index == s
+        Xs, ys, ws = X[rows], y[rows], w[rows]
+        S0[s] = ws.sum()
+        S1[s] = ws @ Xs
+        S2[s] = Xs.T @ (Xs * ws[:, None])
+        T1[s] = ws @ ys
+        T2[s] = Xs.T @ (ws * ys)
+    return S0, S1, S2, T1, T2
+
+
+def _ridge_from_stats(stats, counts, alpha):
+    """Weighted ridge from per-season sums (counts say how often each season is used)."""
+    S0s, S1s, S2s, T1s, T2s = stats
+    S0 = float(counts @ S0s)
+    S1 = counts @ S1s
+    S2 = np.tensordot(counts, S2s, axes=1)
+    T1 = float(counts @ T1s)
+    T2 = counts @ T2s
+
+    mu = S1 / S0
+    sd = np.sqrt(np.maximum(np.diag(S2) / S0 - mu ** 2, 0.0))
+    sd[sd == 0] = 1.0
+    y_mean = T1 / S0
+    centered = S2 - np.outer(S1, mu) - np.outer(mu, S1) + S0 * np.outer(mu, mu)
+    cross = T2 - mu * T1 - S1 * y_mean + S0 * mu * y_mean
+    A = centered / np.outer(sd, sd) + alpha * np.eye(len(mu))
+    coef = np.linalg.solve(A, cross / sd)
+    return mu, sd, y_mean, coef
+
+
+def _fit_variant_blocked(X, y, w, season_index, season_fold, k, alphas):
+    """Cross-validate, fit and bootstrap one model using per-season sums.
+
+    Fast enough for tens of thousands of lineups. The uncertainty refits
+    resample whole seasons, which is also more honest than resampling
+    lineups, since lineups in a season share opponents and context.
+    """
+    n_seasons = len(season_fold)
+    stats = _season_stats(X, y, w, season_index, n_seasons)
+    row_fold = season_fold[season_index]
+
+    best = None
+    fold_counts = [(season_fold != f).astype(float) for f in range(k)]
+    for alpha in alphas:
+        oof = np.zeros(len(y))
+        for f in range(k):
+            model = _ridge_from_stats(stats, fold_counts[f], alpha)
+            test = row_fold == f
+            oof[test] = _ridge_predict(model, X[test])
+        sse = float((w * (y - oof) ** 2).sum())
+        if best is None or sse < best[0]:
+            best = (sse, alpha, oof)
+    sse, alpha, oof = best
+
+    model = _ridge_from_stats(stats, np.ones(n_seasons), alpha)
+    rng = np.random.default_rng(0)
+    fits = [
+        _ridge_from_stats(
+            stats,
+            rng.multinomial(n_seasons, np.full(n_seasons, 1.0 / n_seasons)).astype(float),
+            alpha,
+        )
+        for _ in range(BUILDER_BOOTSTRAPS)
+    ]
+    boot = {
+        "mu": np.array([f[0] for f in fits]),
+        "sd": np.array([f[1] for f in fits]),
+        "ym": np.array([f[2] for f in fits]),
+        "coef": np.array([f[3] for f in fits]),
+    }
+    return alpha, sse, oof, model, boot
+
+
 @st.cache_data(show_spinner="Fitting the model across seasons...")
-def fit_builder_models(profiles, feature_cols, target_col):
+def fit_builder_models(profiles, feature_cols, target_col, weight_col=None, carry_cols=()):
     """Fit additive and interaction models, scored on unseen seasons.
 
     Seasons are split into folds, and each fold is predicted by a model
     that never saw those seasons. That out-of-sample score is the honest
     measure of whether the model actually understands anything.
+
+    With a weight column (real lineups), rows count in proportion to their
+    minutes, since ratings from more minutes are less noisy.
     """
     data = profiles.dropna(subset=[target_col]).reset_index(drop=True)
     y = data[target_col].to_numpy(float)
+
+    weights = None
+    if weight_col is not None:
+        weights = data[weight_col].to_numpy(float)
+        weights = weights / weights.mean()
+    w_all = weights if weights is not None else np.ones(len(y))
 
     seasons = data["Season"].astype(str).to_numpy()
     unique_seasons = sorted(set(seasons))
@@ -1073,71 +1186,111 @@ def fit_builder_models(profiles, feature_cols, target_col):
     fold_of = {s: i % k for i, s in enumerate(unique_seasons)}
     folds = np.array([fold_of[s] for s in seasons])
 
-    total_ss = ((y - y.mean()) ** 2).sum()
-    results = {}
+    season_index = np.array([unique_seasons.index(s) for s in seasons]) if len(unique_seasons) < 200 else None
+    season_fold = np.array([fold_of[s] for s in unique_seasons])
+    blocked = weights is not None and len(unique_seasons) >= 8
 
+    y_bar = float((w_all * y).sum() / w_all.sum())
+    total_ss = float((w_all * (y - y_bar) ** 2).sum())
+    alphas = (
+        BUILDER_ALPHAS if weights is None
+        else [a * len(y) / 500.0 for a in BUILDER_ALPHAS]
+    )
+
+    def subset(array, index):
+        return None if array is None else array[index]
+
+    results = {}
     for name, interactions in (("additive", False), ("interact", True)):
         design = _design(data[feature_cols], interactions)
         X = design.to_numpy(float)
 
-        best = None
-        for alpha in BUILDER_ALPHAS:
-            oof = np.zeros(len(y))
-            for fold in range(k):
-                train, test = folds != fold, folds == fold
-                model = _ridge_fit(X[train], y[train], alpha)
-                oof[test] = _ridge_predict(model, X[test])
-            sse = float(((y - oof) ** 2).sum())
-            if best is None or sse < best[0]:
-                best = (sse, alpha, oof)
+        if blocked:
+            alpha, sse, oof, model, boot = _fit_variant_blocked(
+                X, y, weights, season_index, season_fold, k, alphas
+            )
+        else:
+            best = None
+            for alpha in alphas:
+                oof = np.zeros(len(y))
+                for fold in range(k):
+                    train, test = folds != fold, folds == fold
+                    model = _ridge_fit(X[train], y[train], alpha, subset(weights, train))
+                    oof[test] = _ridge_predict(model, X[test])
+                sse = float((w_all * (y - oof) ** 2).sum())
+                if best is None or sse < best[0]:
+                    best = (sse, alpha, oof)
 
-        sse, alpha, oof = best
-        model = _ridge_fit(X, y, alpha)
+            sse, alpha, oof = best
+            model = _ridge_fit(X, y, alpha, weights)
 
-        # Refit on resampled history. When a lineup is unlike anything in
-        # the data, these refits disagree with each other, and that
-        # disagreement is the model's honest measure of what it doesn't know.
-        rng = np.random.default_rng(0)
-        fits = [
-            _ridge_fit(X[idx], y[idx], alpha)
-            for idx in (rng.integers(0, len(y), len(y))
-                        for _ in range(BUILDER_BOOTSTRAPS))
-        ]
-        boot = {
-            "mu": np.array([f[0] for f in fits]),
-            "sd": np.array([f[1] for f in fits]),
-            "ym": np.array([f[2] for f in fits]),
-            "coef": np.array([f[3] for f in fits]),
-        }
+            # Refit on resampled history. When a lineup is unlike anything in
+            # the data, these refits disagree with each other, and that
+            # disagreement is the model's honest measure of what it doesn't know.
+            rng = np.random.default_rng(0)
+            fits = [
+                _ridge_fit(X[idx], y[idx], alpha, subset(weights, idx))
+                for idx in (rng.integers(0, len(y), len(y))
+                            for _ in range(BUILDER_BOOTSTRAPS))
+            ]
+            boot = {
+                "mu": np.array([f[0] for f in fits]),
+                "sd": np.array([f[1] for f in fits]),
+                "ym": np.array([f[2] for f in fits]),
+                "coef": np.array([f[3] for f in fits]),
+            }
 
         results[name] = {
             "boot": boot,
             "alpha": alpha,
             "r2": 1 - sse / total_ss,
-            "rmse": float(np.sqrt(sse / len(y))),
+            "rmse": float(np.sqrt(sse / w_all.sum())),
             "oof": oof,
             "fitted": _ridge_predict(model, X),
             "model": model,
             "columns": list(design.columns),
         }
 
-    # What do real historical cores look like? Used by the guardrails.
+    # What do real historical groups look like? Used by the guardrails.
     F = data[feature_cols].to_numpy(float)
-    center = F.mean(axis=0)
-    cov = np.cov(F, rowvar=False) + 1e-6 * np.eye(F.shape[1])
+    if weights is None:
+        center = F.mean(axis=0)
+        cov = np.cov(F, rowvar=False) + 1e-6 * np.eye(F.shape[1])
+        lo, hi = np.percentile(F, 1, axis=0), np.percentile(F, 99, axis=0)
+    else:
+        center = (weights[:, None] * F).sum(axis=0) / weights.sum()
+        centered_w = F - center
+        cov = (weights[:, None] * centered_w).T @ centered_w / weights.sum()
+        cov = cov + 1e-6 * np.eye(F.shape[1])
+        lo = np.array([_weighted_percentile(F[:, j], weights, 1) for j in range(F.shape[1])])
+        hi = np.array([_weighted_percentile(F[:, j], weights, 99) for j in range(F.shape[1])])
     inverse = np.linalg.inv(cov)
     centered = F - center
     results["support"] = {
         "mu": center,
         "inv": inverse,
         "d2": np.einsum("ij,jk,ik->i", centered, inverse, centered),
-        "lo": np.percentile(F, 1, axis=0),
-        "hi": np.percentile(F, 99, axis=0),
+        "lo": lo,
+        "hi": hi,
+        "w": weights,
     }
 
-    results["data"] = data[["Season", "Tm", "Era", "Core five"]].assign(
-        actual=y
+    # Best and worst real results to compare against (ignoring tiny samples).
+    reference_rows = np.ones(len(y), dtype=bool)
+    if "Minutes" in data.columns:
+        big = data["Minutes"].to_numpy(float) >= 200
+        if big.sum() >= 30:
+            reference_rows = big
+    results["reference"] = (
+        float(y[reference_rows].max()), float(y[reference_rows].min())
     )
+
+    keep = ["Season", "Tm", "Era", "Core five"] + [
+        c for c in carry_cols if c in data.columns
+    ]
+    results["data"] = data[keep].assign(actual=y)
+    if weight_col is not None:
+        results["data"]["weight"] = data[weight_col].to_numpy(float)
     return results
 
 
@@ -1160,10 +1313,12 @@ def render_team_builder(df, player_labels, player_options):
         st.markdown(
             "- Each player-season is compared with the league in **its own "
             "season**, so players from different eras can share a lineup.\n"
-            "- Each historical team is summarized by the average profile of "
-            "its **five highest-minute players**.\n"
+            "- Each real five-man lineup (or, in the older method, each "
+            "team's five highest-minute players) is summarized by the "
+            "average profile of its five players.\n"
             "- A model learns how those profiles relate to results, and is "
-            "scored only on **seasons it hasn't seen**.\n"
+            "scored only on **seasons it hasn't seen**. With lineup data, "
+            "lineups with more minutes count for more.\n"
             "- A second version also gets *interaction* terms (products of "
             "skills). If it predicts unseen seasons better, that's evidence "
             "that skills stack beyond simple addition.\n"
@@ -1185,13 +1340,8 @@ def render_team_builder(df, player_labels, player_options):
             "most with defense and real pair-level synergy."
         )
 
-    teams = build_team_seasons(df)
-    if teams.empty:
-        st.warning("The Team Lab needs to work first (Season and Tm columns).")
-        return
-
     zfeat, profiles, pools = builder_tables(df)
-    if profiles.empty:
+    if zfeat.shape[1] < 6:
         st.warning(
             "Not enough of the needed stat columns to build lineup "
             "profiles (need minutes, TotalPoss, and shot/box-score stats)."
@@ -1199,26 +1349,66 @@ def render_team_builder(df, player_labels, player_options):
         return
 
     base_cols = list(zfeat.columns)
-    feature_cols = [
-        c for c in profiles.columns
-        if c not in ("Season", "Tm", "Core five")
-    ]
+
+    # ---- Real five-man lineups, if the files are present ----
+    lineup_data, lineup_problem, lineup_info = None, None, None
+    if any(path.exists() for path in LINEUP_FILES):
+        try:
+            loaded, loaded_report = load_lineups()
+            if loaded is None:
+                lineup_problem = "; ".join(loaded_report["problems"])
+            else:
+                lineup_data = loaded
+        except Exception as error:
+            lineup_problem = f"The lineup files couldn't be used: {error}"
+
+    use_lineups = False
+    if lineup_data is not None:
+        data_basis = st.radio(
+            "Learn from",
+            ["Real five-man lineups (recommended)", "Team results (older method)"],
+            index=0,
+            horizontal=True,
+            key="builder_data_basis",
+            help="Real lineups are exactly what this tool predicts: five "
+                 "players on the floor together. The older method learns "
+                 "from whole teams and has to estimate the bench's effect.",
+        )
+        use_lineups = data_basis.startswith("Real")
+    elif lineup_problem:
+        st.caption(lineup_problem)
 
     # ---- Targets ----
     targets = {}
-    if "Net rating (approx.)" in teams.columns:
-        targets["Net rating"] = ("Net rating (approx.)", 1)
-    if "Points per 100 poss" in teams.columns:
-        targets["Offense (points scored per 100)"] = (
-            "Points per 100 poss", 1
-        )
-    if "Points allowed per 100 poss (approx.)" in teams.columns:
-        targets["Defense (points prevented per 100)"] = (
-            "Points allowed per 100 poss (approx.)", -1
-        )
+    teams = None
+    if use_lineups:
+        for label, (column, sign_) in LINEUP_TARGET_COLUMNS.items():
+            if lineup_data[column].notna().any():
+                targets[label] = (column, sign_)
+    else:
+        teams = build_team_seasons(df)
+        if teams.empty:
+            st.warning("The Team Lab needs to work first (Season and Tm columns).")
+            return
+        if profiles.empty:
+            st.warning(
+                "Not enough of the needed stat columns to build lineup "
+                "profiles (need minutes, TotalPoss, and shot/box-score stats)."
+            )
+            return
+        if "Net rating (approx.)" in teams.columns:
+            targets["Net rating"] = ("Net rating (approx.)", 1)
+        if "Points per 100 poss" in teams.columns:
+            targets["Offense (points scored per 100)"] = (
+                "Points per 100 poss", 1
+            )
+        if "Points allowed per 100 poss (approx.)" in teams.columns:
+            targets["Defense (points prevented per 100)"] = (
+                "Points allowed per 100 poss (approx.)", -1
+            )
 
     if not targets:
-        st.warning("No team results columns available to learn from.")
+        st.warning("No results columns available to learn from.")
         return
 
     target_label = st.radio(
@@ -1229,37 +1419,67 @@ def render_team_builder(df, player_labels, player_options):
     )
     source_col, sign = targets[target_label]
 
-    merged = profiles.merge(
-        teams[["Season", "Tm", "Era", source_col]],
-        on=["Season", "Tm"],
-        how="left",
-    )
-    merged["_target"] = sign * (
-        merged[source_col]
-        - merged.groupby("Season")[source_col].transform("mean")
-    )
-
-    if "Net rating" in target_label:
-        season_means = teams.groupby("Season")["Net rating (approx.)"].mean()
-        if season_means.abs().max() > 2:
-            st.warning(
-                "Net rating should average about 0 in every season, but "
-                f"some seasons are off by up to {season_means.abs().max():.1f}. "
-                "That suggests PlusMinus or the possession estimate isn't "
-                "what I assumed. Treat net-rating results with suspicion, "
-                "or try the Offense target."
-            )
-
-    usable = merged["_target"].notna().sum()
-    if usable < 100 or merged["Season"].nunique() < 3:
-        st.warning(
-            f"Only {usable} usable team-seasons across "
-            f"{merged['Season'].nunique()} seasons. That's too few to "
-            "fit a trustworthy model."
+    if use_lineups:
+        training, _, pools, lineup_info = build_lineup_training(
+            df, lineup_data, zfeat, pools, tuple(base_cols), _lineup_cache_key()
         )
-        return
+        if training is None:
+            st.warning(lineup_info.get("reason", "Couldn't build profiles from the lineups."))
+            return
 
-    results = fit_builder_models(merged, feature_cols, "_target")
+        merged = training.copy()
+        merged["_target"] = sign * merged[source_col]
+        feature_cols = base_cols + [
+            label for label, _, _ in ROLE_FEATURES if label in merged.columns
+        ]
+        usable = int(merged["_target"].notna().sum())
+        if usable < 500 or merged["Season"].nunique() < 3:
+            st.warning(
+                f"Only {usable} usable lineups across "
+                f"{merged['Season'].nunique()} seasons. That's too few to "
+                "fit a trustworthy model."
+            )
+            return
+        results = fit_builder_models(
+            merged, feature_cols, "_target", "weight", ("Team", "Minutes")
+        )
+    else:
+        feature_cols = [
+            c for c in profiles.columns
+            if c not in ("Season", "Tm", "Core five")
+        ]
+        merged = profiles.merge(
+            teams[["Season", "Tm", "Era", source_col]],
+            on=["Season", "Tm"],
+            how="left",
+        )
+        merged["_target"] = sign * (
+            merged[source_col]
+            - merged.groupby("Season")[source_col].transform("mean")
+        )
+
+        if "Net rating" in target_label:
+            season_means = teams.groupby("Season")["Net rating (approx.)"].mean()
+            if season_means.abs().max() > 2:
+                st.warning(
+                    "Net rating should average about 0 in every season, but "
+                    f"some seasons are off by up to {season_means.abs().max():.1f}. "
+                    "That suggests PlusMinus or the possession estimate isn't "
+                    "what I assumed. Treat net-rating results with suspicion, "
+                    "or try the Offense target."
+                )
+
+        usable = merged["_target"].notna().sum()
+        if usable < 100 or merged["Season"].nunique() < 3:
+            st.warning(
+                f"Only {usable} usable team-seasons across "
+                f"{merged['Season'].nunique()} seasons. That's too few to "
+                "fit a trustworthy model."
+            )
+            return
+
+        results = fit_builder_models(merged, feature_cols, "_target")
+
     additive, interact = results["additive"], results["interact"]
 
     # ---- Pair chemistry layer (learned from the pair data) ----
@@ -1304,12 +1524,47 @@ def render_team_builder(df, player_labels, player_options):
         )
         default_model = 0
 
-    st.caption(
-        "The percentage is the share of team-to-team differences within "
-        "a season that the model predicts correctly on seasons it never "
-        "trained on. Real basketball has plenty this model can't see, so "
-        "a modest number is normal."
-    )
+    if use_lineups:
+        st.caption(
+            f"Learned from {lineup_info['training_lineups']:,} real five-man "
+            f"lineups ({lineup_info['training_minutes']:,.0f} minutes), "
+            "weighted by minutes. The percentage is the share of "
+            "lineup-to-lineup differences within a season that the model "
+            "predicts correctly on seasons it never trained on. Five-man "
+            "ratings are noisy, so a modest number is normal."
+        )
+        with st.expander("How did the older team-based method do on real lineups?"):
+            check = legacy_scale_check(
+                df, zfeat, profiles, merged, feature_cols, target_label
+            )
+            if check is None:
+                st.write("Couldn't run the comparison (it needs the team-level data).")
+            else:
+                k1, k2, k3 = st.columns(3)
+                k1.metric(
+                    "Its predictions needed scaling by",
+                    f"{check['slope']:.2f}x",
+                    help="How much the old team-based predictions would have "
+                         "to be multiplied by to match what real lineups did.",
+                )
+                k2.metric(
+                    "My bench-dilution guess was",
+                    "—" if check["guess"] is None else f"{check['guess']:.2f}x",
+                )
+                k3.metric("Correlation with real lineups", f"{check['corr']:.2f}")
+                st.caption(
+                    "The old method learned from whole teams and divided out "
+                    "the bench's share of minutes. If the first number is "
+                    "close to the second, that guess was about right. If "
+                    "not, the real lineups are correcting it."
+                )
+    else:
+        st.caption(
+            "The percentage is the share of team-to-team differences within "
+            "a season that the model predicts correctly on seasons it never "
+            "trained on. Real basketball has plenty this model can't see, so "
+            "a modest number is normal."
+        )
 
     use_pair_layer = False
     if pair_layer is not None and pair_layer.get("ok"):
@@ -1323,14 +1578,14 @@ def render_team_builder(df, player_labels, player_options):
                 "How much shows up",
                 f"{bt['lam']:.2f}x",
                 help="Summed pair chemistry is multiplied by this. 1.0 would "
-                     "mean it shows up in team results at full strength.",
+                     "mean it shows up in results at full strength.",
             )
             if bt["helps"]:
                 st.success(
                     f"Adding pair chemistry improved predictions of unseen "
                     f"seasons from {bt['r2_without']:.1%} to "
                     f"{bt['r2_with']:.1%}. About {bt['lam']:.0%} of the summed "
-                    "pair chemistry shows up in team results, so it's scaled "
+                    "pair chemistry shows up in results, so it's scaled "
                     "by that."
                 )
             else:
@@ -1385,7 +1640,9 @@ def render_team_builder(df, player_labels, player_options):
         )
 
     # ---- Calibration: is the model too cautious? ----
-    cal = calibration_summary(results["data"]["actual"], chosen["oof"])
+    cal = calibration_summary(
+        results["data"]["actual"], chosen["oof"], results["data"].get("weight")
+    )
     with st.expander("Is the model too cautious? (calibration check)"):
         if np.isnan(cal["slope"]):
             st.write("Not enough data to check.")
@@ -1396,7 +1653,7 @@ def render_team_builder(df, player_labels, player_options):
             )
             st.dataframe(
                 cal["table"].style.format(
-                    {"Predicted": "{:+.1f}", "Actual": "{:+.1f}", "Teams": "{:.0f}"}
+                    {"Predicted": "{:+.1f}", "Actual": "{:+.1f}", "Rows": "{:.0f}"}
                 ),
                 use_container_width=True,
             )
@@ -1427,31 +1684,37 @@ def render_team_builder(df, player_labels, player_options):
     # The model learns from whole teams, whose benches dilute the five best
     # players. A lineup is the five on the floor together, so that dilution
     # is divided back out.
-    core_share = top_five_minute_share(df)
+    core_share = None if use_lineups else top_five_minute_share(df)
     basis_scale = (1.0 / core_share) if core_share else 1.0
     calib_scale = cal["scale"] if (calibrate and not np.isnan(cal["slope"])) else 1.0
-    st.caption(
-        f"Ratings are for these five on the floor together. The model "
-        f"learns from whole teams, where the top five play about "
-        f"{core_share:.0%} of the minutes, so the bench's dilution is "
-        f"divided out ({basis_scale:.2f}x). That's an estimate until "
-        "five-man lineup data replaces it."
-        if core_share else
-        "Ratings are for these five on the floor together. The bench's "
-        "dilution couldn't be estimated from this data, so none is "
-        "removed."
-    )
+    if use_lineups:
+        st.caption(
+            "Ratings are for these five on the floor together, learned "
+            "directly from real five-man lineups, so no bench adjustment "
+            "is needed."
+        )
+    else:
+        st.caption(
+            f"Ratings are for these five on the floor together. The model "
+            f"learns from whole teams, where the top five play about "
+            f"{core_share:.0%} of the minutes, so the bench's dilution is "
+            f"divided out ({basis_scale:.2f}x). That's an estimate."
+            if core_share else
+            "Ratings are for these five on the floor together. The bench's "
+            "dilution couldn't be estimated from this data, so none is "
+            "removed."
+        )
 
     mode_col1, mode_col2 = st.columns(2)
     with mode_col1:
         guardrail_mode = st.radio(
             "Unusual lineups",
             ["Extrapolate and show the uncertainty",
-             "Strict: cap at the best and worst real teams"],
+             "Strict: cap at the best and worst real results"],
             index=0,
             key="builder_guardrails",
             help="The first option lets the model say a group beats every "
-                 "real team, with a range showing how unsure it is. The "
+                 "real result, with a range showing how unsure it is. The "
                  "second keeps results inside what has actually happened.",
         )
     with mode_col2:
@@ -1541,7 +1804,11 @@ def render_team_builder(df, player_labels, player_options):
         # How far is this group from anything that ever actually played?
         centered = raw_vec - support["mu"]
         lineup_d2 = float(centered @ support["inv"] @ centered)
-        unusual_pct = float((support["d2"] < lineup_d2).mean() * 100)
+        below = (support["d2"] < lineup_d2).astype(float)
+        unusual_pct = float(
+            (np.average(below, weights=support["w"]) if support.get("w") is not None
+             else below.mean()) * 100
+        )
         beyond_history = lineup_d2 > float(support["d2"].max())
 
         # Products of extreme values explode, so for the most unusual
@@ -1578,8 +1845,7 @@ def render_team_builder(df, player_labels, player_options):
                 pair_layer["backtest"]["lam"] * pair_table["Blended"].sum()
             )
 
-        best_seen = float(results["data"]["actual"].max())
-        worst_seen = float(results["data"]["actual"].min())
+        best_seen, worst_seen = results["reference"]
         _, unadjusted_prediction = model_output(raw_vec)
 
         trust = 1.0
@@ -1669,11 +1935,17 @@ def render_team_builder(df, player_labels, player_options):
                 "model was used instead."
             )
 
-        st.caption(
-            f"For scale: the best real team in the data works out to "
-            f"{best_seen * basis_scale:+.1f} on a five-on-the-floor basis, "
-            f"and the worst to {worst_seen * basis_scale:+.1f}."
-        )
+        if use_lineups:
+            st.caption(
+                f"For scale: the best real lineup in the data (200+ minutes) "
+                f"was {best_seen:+.1f} and the worst was {worst_seen:+.1f}."
+            )
+        else:
+            st.caption(
+                f"For scale: the best real team in the data works out to "
+                f"{best_seen * basis_scale:+.1f} on a five-on-the-floor basis, "
+                f"and the worst to {worst_seen * basis_scale:+.1f}."
+            )
 
         scaled_any = any(r["Everyone scaled to"] < 0.98 for r in pool_report)
 
@@ -1734,7 +2006,7 @@ def render_team_builder(df, player_labels, player_options):
             )
         elif not strict and prediction_team > best_seen:
             st.info(
-                f"This beats the best real team in the data "
+                f"This beats the best real result in the data "
                 f"({best_seen:+.1f}). Check the range and the drivers "
                 "below before trusting it."
             )
@@ -1812,6 +2084,48 @@ def render_team_builder(df, player_labels, player_options):
                 f"{pair_layer['backtest']['lam']:.2f} to {synergy_effect:+.2f} "
                 "per 100 in the prediction."
             )
+
+        if lineup_data is not None:
+            hist_column, hist_sign = LINEUP_TARGET_COLUMNS[target_label]
+            same_five = lineup_history(
+                lineup_data, [df.loc[r, "player_id"] for r in selected_rows]
+            )
+            st.markdown("#### Has this exact five played together?")
+            if same_five.empty:
+                st.caption(
+                    "Not in the lineup data. These five never shared the "
+                    "floor (or only did so outside the downloaded top "
+                    "players), so the estimate rests on skills alone."
+                )
+            else:
+                minutes_together = float(same_five["Minutes"].sum())
+                observed = float(
+                    hist_sign * (same_five[hist_column] * same_five["Minutes"]).sum()
+                    / minutes_together
+                )
+                trust_history = minutes_together / (minutes_together + LINEUP_SHRINK_MINUTES)
+                blended_history = trust_history * observed + (1 - trust_history) * prediction
+                h1, h2, h3 = st.columns(3)
+                h1.metric("What actually happened", f"{observed:+.1f}",
+                          help="Minutes-weighted, relative to a league-average team.")
+                h2.metric("Minutes together", f"{minutes_together:,.0f}")
+                h3.metric("Blended with the estimate", f"{blended_history:+.1f}",
+                          help="Leans on real history more as minutes grow.")
+                st.dataframe(
+                    same_five[["Season", "Team", "Minutes", "Sample", "NetRtg", "OffRtg", "DefRtg"]]
+                    .rename(columns={"NetRtg": "Net", "OffRtg": "Off", "DefRtg": "Def"})
+                    .style.format({"Minutes": "{:.0f}", "Net": "{:+.1f}",
+                                   "Off": "{:.1f}", "Def": "{:.1f}"}, na_rep="—"),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.caption(
+                    "Five-man results are noisy, so the blend trusts them "
+                    "slowly. "
+                    + ("The model was trained on lineups like this one, so "
+                       "agreement here isn't an independent test."
+                       if use_lineups else "")
+                )
 
         # ---- How this number was built ----
         def model_for(key, vector):
@@ -1955,7 +2269,10 @@ def render_team_builder(df, player_labels, player_options):
         )
 
     # ---- Over- and under-performers ----
-    with st.expander("Teams that beat or missed their parts (synergy candidates)"):
+    with st.expander(
+        ("Lineups" if use_lineups else "Teams")
+        + " that beat or missed their parts (synergy candidates)"
+    ):
         history = results["data"].copy()
         history["predicted"] = chosen["oof"]
         history["difference"] = history["actual"] - history["predicted"]
@@ -1972,9 +2289,12 @@ def render_team_builder(df, player_labels, player_options):
         )
         history = history[history["Era"].isin(era_pick)]
 
-        view = history[
+        shown_columns = (
+            ["Season", "Team", "Core five", "Minutes", "actual", "predicted", "difference"]
+            if use_lineups else
             ["Season", "Tm", "Core five", "actual", "predicted", "difference"]
-        ].rename(columns={
+        )
+        view = history[shown_columns].rename(columns={
             "actual": "Actual",
             "predicted": "Predicted (unseen)",
             "difference": "Beat prediction by",
@@ -1984,7 +2304,10 @@ def render_team_builder(df, player_labels, player_options):
             "Actual": "{:+.1f}",
             "Predicted (unseen)": "{:+.1f}",
             "Beat prediction by": "{:+.1f}",
+            "Minutes": "{:.0f}",
         }
+        if use_lineups:
+            view = view[view["Minutes"] >= LINEUP_CAP_MIN_MINUTES]
 
         st.markdown("**Beat their parts the most**")
         st.dataframe(
@@ -2893,57 +3216,80 @@ def fit_pair_synergy(_pairs, _zfeat, _row_of, base_cols, target_label, cache_key
 
 @st.cache_data(show_spinner=False)
 def pair_layer_backtest(_model, _zfeat, _cores, _builder, base_cols, target_label, cache_key):
-    """Does adding pair chemistry help predict team results on unseen seasons?
+    """Does adding pair chemistry help predict results on unseen seasons?
 
-    For each historical team, sum the expected chemistry of its five main
-    players' 10 pairs (from a model that never saw that season), then see how
-    well that explains what the sum-of-parts model got wrong.
+    For each historical team (or real lineup), sum the expected chemistry of
+    its five main players' 10 pairs (from a model that never saw that
+    season), then see how well that explains what the sum-of-parts model got
+    wrong. Rows are weighted by minutes when the data has weights.
     """
     data = _builder["data"]
     oof_add = np.asarray(_builder["additive"]["oof"], float)
     actual = data["actual"].to_numpy(float)
+    weights = (
+        data["weight"].to_numpy(float) if "weight" in data.columns
+        else np.ones(len(data))
+    )
     rows_i, rows_j = np.triu_indices(5, k=1)
 
+    out = {"n": 0, "helps": False, "lam": 0.0}
+    core_rows = [_cores.get(key) for key in zip(data["Season"], data["Tm"])]
+    valid = np.array([r is not None and len(r) == 5 for r in core_rows])
+    if valid.sum() < 100:
+        return out
+
+    valid_index = np.where(valid)[0]
+    rows = np.array([core_rows[i] for i in valid_index])
+    positions = _zfeat.index.get_indexer(rows.ravel()).reshape(rows.shape)
+    z = _zfeat[list(base_cols)].to_numpy(float)[positions]   # rows x 5 x skills
+
+    seasons_valid = data["Season"].astype(str).to_numpy()[valid_index]
+    fold_ids = np.array([_model["fold_of"].get(s, -1) for s in seasons_valid])
+
     summed = np.full(len(data), np.nan)
-    for n, (season, team) in enumerate(zip(data["Season"], data["Tm"])):
-        rows = _cores.get((season, team))
-        if rows is None or len(rows) != 5:
-            continue
-        z = _zfeat.loc[rows, list(base_cols)].to_numpy(float)
-        fold = _model["fold_of"].get(str(season))
-        summed[n] = _pair_predict(_model, z[rows_i], z[rows_j], fold).sum()
+    for fold_id in np.unique(fold_ids):
+        chosen = fold_ids == fold_id
+        fold = None if fold_id == -1 else int(fold_id)
+        part = np.zeros(int(chosen.sum()))
+        for i, j in zip(rows_i, rows_j):
+            part += _pair_predict(_model, z[chosen, i, :], z[chosen, j, :], fold)
+        summed[valid_index[chosen]] = part
 
     ok = ~np.isnan(summed)
-    out = {"n": int(ok.sum()), "helps": False, "lam": 0.0}
+    out["n"] = int(ok.sum())
     if ok.sum() < 100 or np.nanstd(summed) == 0:
         return out
 
-    s = summed[ok]
-    y = actual[ok]
-    base = oof_add[ok]
+    s, y, base = summed[ok], actual[ok], oof_add[ok]
+    w = weights[ok] / weights[ok].mean()
     miss = y - base
 
-    lam_raw = float((s * miss).sum() / (s ** 2).sum())
+    denom = float((w * s ** 2).sum())
+    lam_raw = float((w * s * miss).sum() / denom)
     resid = miss - lam_raw * s
-    se = float(np.sqrt((resid ** 2).sum() / max(len(s) - 1, 1) / (s ** 2).sum()))
+    se = float(np.sqrt((w * resid ** 2).sum() / max(len(s) - 1, 1) / denom))
 
     # Cross-fit the strength so the score isn't flattering itself.
     seasons = data["Season"].to_numpy()[ok].astype(str)
     unique = sorted(set(seasons))
     k = min(5, len(unique))
-    fold_of = {x: i % k for i, x in enumerate(unique)}
-    folds = np.array([fold_of[x] for x in seasons])
+    fold_of = {x_: i % k for i, x_ in enumerate(unique)}
+    folds = np.array([fold_of[x_] for x_ in seasons])
     adjustment = np.zeros(len(s))
     for f in range(k):
         test = folds == f
         train = ~test
-        denom = float((s[train] ** 2).sum())
-        lam_f = float(np.clip((s[train] * miss[train]).sum() / denom, 0, 1.5)) if denom > 0 else 0.0
+        d_train = float((w[train] * s[train] ** 2).sum())
+        lam_f = (
+            float(np.clip((w[train] * s[train] * miss[train]).sum() / d_train, 0, 1.5))
+            if d_train > 0 else 0.0
+        )
         adjustment[test] = lam_f * s[test]
 
-    total = float(((y - y.mean()) ** 2).sum())
-    r2_without = 1 - float(((y - base) ** 2).sum()) / total
-    r2_with = 1 - float(((y - base - adjustment) ** 2).sum()) / total
+    y_bar = float((w * y).sum() / w.sum())
+    total = float((w * (y - y_bar) ** 2).sum())
+    r2_without = 1 - float((w * (y - base) ** 2).sum()) / total
+    r2_with = 1 - float((w * (y - base - adjustment) ** 2).sum()) / total
 
     lam = float(np.clip(lam_raw, 0, 1.5))
     out.update({
@@ -2952,9 +3298,9 @@ def pair_layer_backtest(_model, _zfeat, _cores, _builder, base_cols, target_labe
         "se": se,
         "r2_without": r2_without,
         "r2_with": r2_with,
-        "rmse_without": float(np.sqrt(((y - base) ** 2).mean())),
-        "rmse_with": float(np.sqrt(((y - base - adjustment) ** 2).mean())),
-        "corr": float(np.corrcoef(s, miss)[0, 1]),
+        "rmse_without": float(np.sqrt((w * (y - base) ** 2).sum() / w.sum())),
+        "rmse_with": float(np.sqrt((w * (y - base - adjustment) ** 2).sum() / w.sum())),
+        "corr": weighted_corr(pd.Series(s), pd.Series(miss), pd.Series(w)),
         "helps": bool((r2_with - r2_without) > 0.003 and lam_raw > 0.1),
     })
     return out
@@ -3141,30 +3487,690 @@ def top_five_minute_share(data):
     return float(np.clip(share.median(), 0.45, 0.95))
 
 
-def calibration_summary(actual, predicted):
+def calibration_summary(actual, predicted, weights=None):
     """Does the model's out-of-sample prediction run too cautious or too bold?"""
     actual = np.asarray(actual, float)
     predicted = np.asarray(predicted, float)
-    ok = ~(np.isnan(actual) | np.isnan(predicted))
-    actual, predicted = actual[ok], predicted[ok]
+    w = np.ones(len(actual)) if weights is None else np.asarray(weights, float)
+    ok = ~(np.isnan(actual) | np.isnan(predicted) | np.isnan(w))
+    actual, predicted, w = actual[ok], predicted[ok], w[ok]
 
     out = {"slope": float("nan"), "scale": 1.0, "table": pd.DataFrame()}
-    if len(actual) < 50 or np.var(predicted) == 0:
+    if len(actual) < 50:
+        return out
+    w = w / w.mean()
+    mp = (w * predicted).sum() / w.sum()
+    ma = (w * actual).sum() / w.sum()
+    variance = float((w * (predicted - mp) ** 2).sum() / w.sum())
+    if variance == 0:
         return out
 
-    slope = float(np.cov(predicted, actual)[0, 1] / np.var(predicted, ddof=1))
+    slope = float((w * (predicted - mp) * (actual - ma)).sum() / w.sum() / variance)
     out["slope"] = slope
     out["scale"] = float(np.clip(slope, 0.8, 1.6))
 
     bins = pd.qcut(predicted, 5, duplicates="drop")
-    table = pd.DataFrame({"bin": bins, "p": predicted, "a": actual})
-    table = table.groupby("bin", observed=True).agg(
-        Predicted=("p", "mean"), Actual=("a", "mean"), Teams=("p", "size")
-    ).reset_index(drop=True)
-    table.index = [f"Group {i + 1}" + (" (lowest)" if i == 0 else " (highest)" if i == len(table) - 1 else "")
-                   for i in range(len(table))]
-    out["table"] = table
+    table = pd.DataFrame({"bin": bins, "p": predicted, "a": actual, "w": w})
+    table["pw"], table["aw"] = table["p"] * table["w"], table["a"] * table["w"]
+    grouped = table.groupby("bin", observed=True)
+    summary = pd.DataFrame({
+        "Predicted": grouped["pw"].sum() / grouped["w"].sum(),
+        "Actual": grouped["aw"].sum() / grouped["w"].sum(),
+        "Rows": grouped["p"].size(),
+    }).reset_index(drop=True)
+    summary.index = [
+        f"Group {i + 1}" + (" (lowest)" if i == 0 else " (highest)" if i == len(summary) - 1 else "")
+        for i in range(len(summary))
+    ]
+    out["table"] = summary
     return out
+
+
+# --------------------------------------------------
+# --------------------------------------------------
+# LINEUP DATA (real five-man lineups)
+# --------------------------------------------------
+
+LINEUP_FILE_NAMES = [
+    "5man_lineups_2000_2009.csv.gz",
+    "5man_lineups_2009_2017.csv.gz",
+    "5man_lineups_2018_2026.csv.gz",
+]
+LINEUP_FILES = [Path(__file__).parent / name for name in LINEUP_FILE_NAMES]
+
+LINEUP_RATES = ["OffRtg", "DefRtg", "NetRtg"]
+LINEUP_PCTS = ["Fg3Pct", "Fg2Pct", "OppFg3Pct", "OppFg2Pct"]
+
+# builder target -> (centered lineup column, sign so + is good)
+LINEUP_TARGET_COLUMNS = {
+    "Net rating": ("NetC", 1),
+    "Offense (points scored per 100)": ("OffC", 1),
+    "Defense (points prevented per 100)": ("DefC", -1),
+}
+
+LINEUP_MODEL_MIN_MINUTES = 40     # lineups below this are too noisy to train on
+LINEUP_WEIGHT_CAP = 800           # no single lineup counts for more than this
+LINEUP_SHRINK_MINUTES = 800       # lineup ratings are very noisy: shrink hard
+LINEUP_CAP_MIN_MINUTES = 200      # lineups used to set "most ever" resource limits
+
+LINEUP_SAMPLE_LABELS = [
+    "⚪ No minutes",
+    "🔴 Very low (<25 min)",
+    "🟠 Low (25-99 min)",
+    "🟡 Moderate (100-299 min)",
+    "🟢 Solid (300+ min)",
+]
+
+
+def lineup_sample_label(minutes):
+    scalar = np.isscalar(minutes)
+    m = pd.to_numeric(pd.Series([minutes] if scalar else minutes), errors="coerce").fillna(0)
+    labels = np.select(
+        [m <= 0, m < 25, m < 100, m < 300],
+        LINEUP_SAMPLE_LABELS[:4],
+        default=LINEUP_SAMPLE_LABELS[4],
+    )
+    return labels[0] if scalar else pd.Series(labels, index=m.index)
+
+
+def _lineup_cache_key():
+    stamps = []
+    for path in list(LINEUP_FILES) + [DATA_FILE, NAME_FILE, PAIR_FILE]:
+        try:
+            stamps.append(path.stat().st_mtime)
+        except Exception:
+            stamps.append(0.0)
+    return tuple(stamps)
+
+
+@st.cache_data(show_spinner="Loading five-man lineup data...")
+def load_lineups():
+    """Combine and clean the lineup files. Returns (data, report).
+
+    Nothing here assumes the files are tidy or non-overlapping: schema, units
+    and scales are detected, and everything unusual goes in the report.
+    """
+    report = {"notes": [], "problems": [], "files": []}
+
+    frames = []
+    for path in LINEUP_FILES:
+        if not path.exists():
+            report["files"].append((path.name, None))
+            continue
+        part = pd.read_csv(path, compression="gzip", dtype=str, low_memory=False)
+        part.columns = [str(c).strip() for c in part.columns]
+        part["_file"] = path.name
+        frames.append(part)
+        report["files"].append((path.name, len(part)))
+
+    if not frames:
+        report["problems"].append("None of the lineup files were found.")
+        return None, report
+
+    d = pd.concat(frames, ignore_index=True)
+    report["rows_raw"] = len(d)
+
+    # ---- the five players ----
+    player_columns = [f"Player{i}Id" for i in range(1, 6)]
+    if all(c in d.columns for c in player_columns):
+        ids = d[player_columns].apply(_clean_id)
+    elif "LineupId" in d.columns:
+        split = (
+            d["LineupId"].astype(str).str.replace(",", "-", regex=False)
+            .str.split("-", expand=True)
+        )
+        if split.shape[1] < 5:
+            report["problems"].append("LineupId doesn't contain five player IDs.")
+            return None, report
+        ids = split.iloc[:, :5].apply(_clean_id)
+        report["notes"].append("Players were read from LineupId.")
+    else:
+        report["problems"].append("No Player1Id..Player5Id or LineupId columns.")
+        return None, report
+
+    if "Minutes" not in d.columns:
+        report["problems"].append("No Minutes column.")
+        return None, report
+
+    # ---- identity columns ----
+    d["Season"] = d["Season"].astype("string").str.strip() if "Season" in d.columns else pd.NA
+    d["SeasonType"] = (
+        d["SeasonType"].astype("string").str.strip()
+        if "SeasonType" in d.columns else "Regular Season"
+    )
+    d["TeamId"] = _clean_id(d["TeamId"]) if "TeamId" in d.columns else pd.NA
+    if "Team" not in d.columns:
+        d["Team"] = d["TeamId"]
+    d["Team"] = d["Team"].astype("string").str.strip()
+
+    for column in ["Minutes"] + LINEUP_RATES + LINEUP_PCTS:
+        if column in d.columns:
+            d[column] = pd.to_numeric(d[column], errors="coerce")
+        else:
+            d[column] = np.nan
+            report["notes"].append(f"Column {column} not in the files; left blank.")
+
+    # ---- keep rows with five distinct players ----
+    ok = ids.notna().all(axis=1) & d["Season"].notna() & d["Team"].notna()
+    report["unusable_rows"] = int((~ok).sum())
+    d, ids = d[ok].copy(), ids[ok]
+    sorted_ids = np.sort(ids.astype(str).to_numpy(), axis=1)
+    distinct = (sorted_ids[:, 1:] != sorted_ids[:, :-1]).all(axis=1)
+    report["not_five_distinct"] = int((~distinct).sum())
+    d, sorted_ids = d[distinct].copy(), sorted_ids[distinct]
+
+    for i in range(5):
+        d[f"Player{i + 1}Id"] = sorted_ids[:, i]
+    d["LineupKey"] = ["-".join(row) for row in sorted_ids]
+
+    # ---- minutes ----
+    positive = d.loc[d["Minutes"] > 0, "Minutes"]
+    if len(positive) and positive.quantile(0.99) > 6000:
+        d["Minutes"] = d["Minutes"] / 60
+        report["notes"].append("Minutes looked like seconds, so they were divided by 60.")
+    elif len(positive):
+        report["notes"].append(
+            f"Minutes treated as minutes (median {positive.median():.0f}, "
+            f"max {positive.max():.0f})."
+        )
+    empty = d["Minutes"].fillna(0) <= 0
+    report["zero_minute_rows"] = int(empty.sum())
+    d = d[~empty].copy()
+
+    # ---- ratings and percentages ----
+    off_def = d["OffRtg"].notna() & d["DefRtg"].notna()
+    if d["NetRtg"].notna().sum() == 0 and off_def.any():
+        d["NetRtg"] = d["OffRtg"] - d["DefRtg"]
+        report["notes"].append("NetRtg was empty; computed as OffRtg - DefRtg.")
+    both = off_def & d["NetRtg"].notna()
+    if both.any():
+        report["net_mismatch_share"] = float(
+            ((d.loc[both, "NetRtg"] - (d.loc[both, "OffRtg"] - d.loc[both, "DefRtg"])).abs() > 0.6).mean()
+        )
+    for column in LINEUP_PCTS:
+        pos = d.loc[d[column] > 0, column]
+        if len(pos) and pos.quantile(0.99) <= 1.5:
+            d[column] = d[column] * 100
+            report["notes"].append(f"{column} was a fraction (0-1); converted to percent.")
+        d.loc[d[column] > 100, column] = np.nan
+        suspect = (d[column] == 0) & (d["Minutes"] < 25)
+        d.loc[suspect, column] = np.nan
+
+    for column in ["Season", "Team", "SeasonType", "TeamId"]:
+        d[column] = d[column].astype(str)
+
+    # ---- the files overlap at the boundaries: keep one copy ----
+    files_per_season = d.groupby("Season")["_file"].nunique()
+    report["overlap_seasons"] = sorted(files_per_season[files_per_season > 1].index.tolist())
+    before = len(d)
+    d = d.sort_values("Minutes", ascending=False).drop_duplicates(
+        ["Season", "SeasonType", "TeamId", "LineupKey"]
+    )
+    report["duplicates_removed"] = before - len(d)
+
+    # ---- names ----
+    lookup = _read_name_lookup()
+    name_columns = []
+    known = pd.Series(True, index=d.index)
+    for i in range(1, 6):
+        mapped = d[f"Player{i}Id"].map(lookup)
+        known &= mapped.notna()
+        d[f"Name{i}"] = mapped.fillna("Player " + d[f"Player{i}Id"])
+        name_columns.append(f"Name{i}")
+    d["Names"] = d[name_columns].agg(", ".join, axis=1)
+    report["name_coverage"] = float(known.mean()) if len(d) else 0.0
+
+    # ---- league and team baselines (minutes-weighted) ----
+    def weighted_mean(frame, by, column):
+        ok = frame[column].notna()
+        part = frame.loc[ok]
+        w = part["Minutes"]
+        total = (part[column] * w).groupby([part[b] for b in by]).sum()
+        return (total / w.groupby([part[b] for b in by]).sum()).rename("_m")
+
+    for rating, label in (("NetRtg", "Net"), ("OffRtg", "Off"), ("DefRtg", "Def")):
+        league = weighted_mean(d, ["Season", "SeasonType"], rating).reset_index()
+        league = league.rename(columns={"_m": f"League{label}"})
+        d = d.merge(league, on=["Season", "SeasonType"], how="left")
+        d[f"{label}C"] = d[rating] - d[f"League{label}"]   # relative to league average
+
+        team = weighted_mean(d, ["Season", "SeasonType", "Team"], rating).reset_index()
+        team = team.rename(columns={"_m": f"Base{label}"})
+        d = d.merge(team, on=["Season", "SeasonType", "Team"], how="left")
+
+    d["NetVsTeam"] = d["NetRtg"] - d["BaseNet"]
+    d["Shrunk"] = d["NetVsTeam"] * d["Minutes"] / (d["Minutes"] + LINEUP_SHRINK_MINUTES)
+    d["Sample"] = lineup_sample_label(d["Minutes"])
+
+    d = d.drop(columns=["_file"]).reset_index(drop=True)
+    report["rows_clean"] = len(d)
+    return d, report
+
+
+def _lineup_avatars(row):
+    """Five small headshots for one lineup row."""
+    columns = st.columns(5)
+    for i, column in enumerate(columns, start=1):
+        with column:
+            st.markdown(
+                mini_player_html(row[f"Player{i}Id"], row[f"Name{i}"], ""),
+                unsafe_allow_html=True,
+            )
+
+
+def _show_lineup_metrics(row):
+    minutes = float(row["Minutes"])
+    st.markdown(f"**Evidence:** {row['Sample']}")
+    if minutes < 100:
+        st.warning(
+            f"Only {minutes:.0f} minutes together. Five-man ratings from "
+            "samples this small are mostly noise."
+        )
+
+    def number(value, fmt):
+        return "—" if pd.isna(value) else fmt.format(value)
+
+    def delta(value, base):
+        if pd.isna(value) or pd.isna(base):
+            return None
+        return f"{value - base:+.1f} vs team"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Minutes together", f"{minutes:,.0f}")
+    c2.metric("Net rating", number(row["NetRtg"], "{:+.1f}"), delta(row["NetRtg"], row["BaseNet"]))
+    c3.metric("Offensive rating", number(row["OffRtg"], "{:.1f}"), delta(row["OffRtg"], row["BaseOff"]))
+    c4.metric("Defensive rating", number(row["DefRtg"], "{:.1f}"),
+              delta(row["DefRtg"], row["BaseDef"]), delta_color="inverse")
+
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("3P%", number(row["Fg3Pct"], "{:.1f}%"))
+    s2.metric("2P%", number(row["Fg2Pct"], "{:.1f}%"))
+    s3.metric("Opponent 3P%", number(row["OppFg3Pct"], "{:.1f}%"))
+    s4.metric("Opponent 2P%", number(row["OppFg2Pct"], "{:.1f}%"))
+
+    if pd.notna(row["NetVsTeam"]):
+        st.caption(
+            f"Net rating vs. the team's baseline: {row['NetVsTeam']:+.1f} raw, "
+            f"{row['Shrunk']:+.1f} after adjusting for sample size. The "
+            "baseline is the team's minutes-weighted average across the "
+            "lineups in the data."
+        )
+
+
+_LINEUP_TABLE_COLUMNS = ["Names", "Season", "Team", "Minutes", "Sample", "NetRtg",
+                         "NetVsTeam", "Shrunk", "OffRtg", "DefRtg", "Fg3Pct",
+                         "Fg2Pct", "OppFg3Pct", "OppFg2Pct"]
+_LINEUP_TABLE_NAMES = {
+    "Names": "Lineup", "NetRtg": "Net", "NetVsTeam": "Net vs team",
+    "Shrunk": "Adjusted vs team", "OffRtg": "Off", "DefRtg": "Def",
+    "Fg3Pct": "3P%", "Fg2Pct": "2P%", "OppFg3Pct": "Opp 3P%", "OppFg2Pct": "Opp 2P%",
+}
+_LINEUP_TABLE_FORMATS = {
+    "Minutes": "{:.0f}", "Net": "{:+.1f}", "Net vs team": "{:+.1f}",
+    "Adjusted vs team": "{:+.1f}", "Off": "{:.1f}", "Def": "{:.1f}",
+    "3P%": "{:.1f}", "2P%": "{:.1f}", "Opp 3P%": "{:.1f}", "Opp 2P%": "{:.1f}",
+}
+
+
+def _lineup_table(frame):
+    view = frame[_LINEUP_TABLE_COLUMNS].rename(columns=_LINEUP_TABLE_NAMES)
+    st.dataframe(
+        view.style.format(_LINEUP_TABLE_FORMATS, na_rep="—"),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+def _lineup_lookup(lineups):
+    types = sorted(lineups["SeasonType"].unique())
+    default_type = types.index("Regular Season") if "Regular Season" in types else 0
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        season_type = st.selectbox("Season type", types, index=default_type, key="ll_type")
+    typed = lineups[lineups["SeasonType"] == season_type]
+    seasons = sorted(typed["Season"].unique(), reverse=True)
+    if not seasons:
+        st.info("No lineups for that season type.")
+        return
+    with c2:
+        season = st.selectbox("Season", seasons, key="ll_season")
+    in_season = typed[typed["Season"] == season]
+    teams = sorted(in_season["Team"].unique())
+    with c3:
+        team = st.selectbox("Team", teams, key="ll_team")
+
+    sub = in_season[in_season["Team"] == team].sort_values("Minutes", ascending=False)
+    st.caption(
+        f"{len(sub):,} lineups, {sub['Minutes'].sum():,.0f} minutes captured "
+        "(a full regular season is roughly 3,900 team minutes; lineups "
+        "outside the downloaded top players aren't included)."
+    )
+    _lineup_table(sub.head(40))
+
+    st.markdown("#### Inspect a lineup")
+    top = sub.head(25).reset_index(drop=True)
+    labels = [f"{row.Names} · {row.Minutes:.0f} min" for row in top.itertuples()]
+    choice = st.selectbox("Lineup", labels, key=f"ll_pick_{season_type}_{season}_{team}")
+    row = top.iloc[labels.index(choice)]
+    _lineup_avatars(row)
+    _show_lineup_metrics(row)
+    st.caption(
+        "Descriptive only. A lineup's rating also reflects its opponents, "
+        "who it played with and against, and luck, and five-man samples are "
+        "small."
+    )
+
+
+def _lineup_explorer(lineups):
+    types = sorted(lineups["SeasonType"].unique())
+    default_type = types.index("Regular Season") if "Regular Season" in types else 0
+
+    f1, f2 = st.columns(2)
+    with f1:
+        season_type = st.selectbox("Season type", types, index=default_type, key="le_type")
+    all_seasons = sorted(lineups.loc[lineups["SeasonType"] == season_type, "Season"].unique())
+    if not all_seasons:
+        st.info("No lineups for that season type.")
+        return
+    with f2:
+        if len(all_seasons) > 1:
+            start, end = st.select_slider(
+                "Seasons", options=all_seasons,
+                value=(all_seasons[0], all_seasons[-1]), key="le_seasons",
+            )
+        else:
+            start = end = all_seasons[0]
+
+    g1, g2, g3 = st.columns(3)
+    with g1:
+        chosen_teams = st.multiselect("Teams (blank = all)", sorted(lineups["Team"].unique()), key="le_teams")
+    with g2:
+        query = st.text_input("Any player name contains", key="le_query")
+    with g3:
+        min_minutes = st.slider("Minimum minutes together", 0, 1500, 150, 25, key="le_min")
+
+    sort_options = {
+        "Net vs team, sample-adjusted (recommended)": ("Shrunk", False),
+        "Net rating": ("NetRtg", False),
+        "Net vs team (raw)": ("NetVsTeam", False),
+        "Offensive rating": ("OffRtg", False),
+        "Defensive rating (lower is better)": ("DefRtg", True),
+        "Minutes together": ("Minutes", False),
+        "3P%": ("Fg3Pct", False),
+        "2P%": ("Fg2Pct", False),
+    }
+    h1, h2, h3 = st.columns(3)
+    with h1:
+        sort_label = st.selectbox("Sort by", list(sort_options.keys()), key="le_sort")
+    with h2:
+        direction = st.radio("Order", ["Best first", "Worst first"], horizontal=True, key="le_dir")
+    with h3:
+        rows_to_show = st.select_slider("Rows to show", options=[25, 50, 100, 250], value=50, key="le_rows")
+
+    f = lineups[
+        (lineups["SeasonType"] == season_type)
+        & lineups["Season"].between(start, end)
+        & (lineups["Minutes"] >= max(min_minutes, 1))
+    ]
+    if chosen_teams:
+        f = f[f["Team"].isin(chosen_teams)]
+    if query.strip():
+        q = query.strip()
+        mask = pd.Series(False, index=f.index)
+        for i in range(1, 6):
+            mask |= f[f"Name{i}"].str.contains(q, case=False, na=False, regex=False)
+        f = f[mask]
+
+    if f.empty:
+        st.info("No lineups match those filters. Try lowering the minimum minutes.")
+        return
+
+    column, best_is_low = sort_options[sort_label]
+    ascending = best_is_low if direction == "Best first" else not best_is_low
+    ranked = f.dropna(subset=[column]).sort_values(column, ascending=ascending)
+
+    st.caption(
+        f"{len(ranked):,} lineups match. "
+        f"{(ranked['Minutes'] < 300).mean():.0%} of them have under 300 minutes together."
+    )
+    _lineup_table(ranked.head(rows_to_show))
+    st.caption(
+        "'Adjusted vs team' pulls small samples toward the team's baseline "
+        "much harder than for pairs, because five-man ratings are far "
+        "noisier. Look for lineups that stay good across seasons."
+    )
+
+
+def _lineup_checks(lineups, report):
+    st.write("What the lineup files actually contain, and what was cleaned.")
+
+    st.markdown("**Files**")
+    for name, rows in report["files"]:
+        st.caption(f"{name}: " + ("not found" if rows is None else f"{rows:,} rows"))
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Rows in files", f"{report['rows_raw']:,}")
+    m2.metric("Rows after cleaning", f"{report['rows_clean']:,}")
+    m3.metric("Seasons", f"{lineups['Season'].nunique()}")
+    m4.metric("Distinct lineups", f"{lineups['LineupKey'].nunique():,}")
+
+    n1, n2, n3, n4 = st.columns(4)
+    n1.metric("Overlap duplicates removed", f"{report['duplicates_removed']:,}",
+              help="The files share boundary seasons.")
+    n2.metric("Zero-minute rows dropped", f"{report['zero_minute_rows']:,}")
+    n3.metric("Not five distinct players", f"{report['not_five_distinct']:,}")
+    n4.metric("Lineups with all names known", f"{report['name_coverage']:.0%}")
+
+    if report.get("overlap_seasons"):
+        st.caption("Seasons found in more than one file: " + ", ".join(report["overlap_seasons"]))
+    for problem in report["problems"]:
+        st.error(problem)
+    for note in report["notes"]:
+        st.caption(note)
+    if report.get("net_mismatch_share", 0) > 0.02:
+        st.warning(
+            f"{report['net_mismatch_share']:.0%} of rows have a NetRtg that "
+            "doesn't equal OffRtg minus DefRtg (beyond rounding)."
+        )
+
+    st.markdown("#### Evidence tiers")
+    tiers = (lineups["Sample"].value_counts()
+             .reindex(LINEUP_SAMPLE_LABELS).fillna(0).astype(int).rename("Lineups"))
+    st.dataframe(tiers.reset_index().rename(columns={"index": "Tier", "Sample": "Tier"}),
+                 use_container_width=True, hide_index=True)
+
+    st.markdown("#### Coverage by season")
+    per_team = lineups.groupby(["SeasonType", "Season", "TeamId"])["Minutes"].agg(["size", "sum"])
+    coverage = per_team.groupby(["SeasonType", "Season"]).agg(
+        Teams=("size", "size"),
+        Median_lineups_per_team=("size", "median"),
+        Median_minutes_per_team=("sum", "median"),
+    ).reset_index()
+    st.dataframe(coverage.round(0), use_container_width=True, hide_index=True)
+    st.caption(
+        "Minutes per team well below ~3,900 means lineups involving players "
+        "outside the downloaded top group aren't represented."
+    )
+
+
+def render_lineup_lab(df):
+    """Lineup Lab: how real five-man lineups performed."""
+    st.subheader("Lineup Lab")
+    st.write(
+        "Real five-man lineups: who played together, for how long, and how "
+        "they did. Five-man samples are small and noisy, so this is for "
+        "finding things worth a closer look."
+    )
+
+    if not any(path.exists() for path in LINEUP_FILES):
+        st.info(
+            "Lineup files not found. Put " + ", ".join(f"`{n}`" for n in LINEUP_FILE_NAMES)
+            + " in the same folder as `app.py`."
+        )
+        return
+
+    try:
+        lineups, report = load_lineups()
+    except Exception as error:
+        st.error(f"Unable to load the lineup data: {error}")
+        return
+    if lineups is None:
+        st.error("; ".join(report["problems"]))
+        return
+
+    look_tab, explore_tab, checks_tab = st.tabs(
+        ["Look up lineups", "Explore lineups", "Data checks"]
+    )
+    with look_tab:
+        _lineup_lookup(lineups)
+    with explore_tab:
+        _lineup_explorer(lineups)
+    with checks_tab:
+        _lineup_checks(lineups, report)
+
+
+# --------------------------------------------------
+# LINEUP MODEL INPUTS (used by the Team Builder)
+# --------------------------------------------------
+
+@st.cache_data(show_spinner="Building lineup profiles from real lineups...")
+def build_lineup_training(_data, _lineups, _zfeat, _pools, base_cols, cache_key):
+    """Skill profile for every real lineup, plus limits on shared resources.
+
+    Returns (training table, cores, pools, report). Each lineup's profile is
+    built exactly like a team's core five: the average of its five players'
+    skill z-scores, plus the best/worst player on the floor for key roles.
+    """
+    base_cols = list(base_cols)
+    row_of = _skill_row_lookup(_data)
+    L = _lineups
+
+    labels = pd.concat(
+        [(L[f"Player{i}Id"] + "|" + L["Season"]).map(row_of) for i in range(1, 6)],
+        axis=1,
+    )
+    matched = labels.notna().all(axis=1)
+    total_minutes = float(L["Minutes"].sum())
+    report = {
+        "lineups": len(L),
+        "matched": int(matched.sum()),
+        "match_rate": float(matched.mean()) if len(L) else 0.0,
+        "minutes_match_rate": float(L.loc[matched, "Minutes"].sum() / total_minutes) if total_minutes else 0.0,
+    }
+    if report["minutes_match_rate"] < 0.5 or matched.sum() < 500:
+        report["reason"] = (
+            f"Only {report['minutes_match_rate']:.0%} of lineup minutes could be "
+            "matched to player stats. Player IDs or season labels probably "
+            "differ between the files."
+        )
+        return None, {}, {}, report
+
+    Lm = L[matched]
+    R = labels[matched].astype(int).to_numpy()
+    zvals = _zfeat[base_cols].to_numpy(float)
+    zpos = _zfeat.index.get_indexer(R.ravel()).reshape(R.shape)
+    Z3 = zvals[zpos]                                   # lineups x 5 players x skills
+
+    prof = pd.DataFrame(Z3.mean(axis=1), columns=base_cols)
+    feature_index = {c: i for i, c in enumerate(base_cols)}
+    for label, feature, how in ROLE_FEATURES:
+        if feature in feature_index:
+            column = Z3[:, :, feature_index[feature]]
+            prof[label] = column.max(axis=1) if how == "max" else column.min(axis=1)
+
+    prof["Season"] = Lm["Season"].to_numpy()
+    prof["Tm"] = (Lm["TeamId"] + ":" + Lm["LineupKey"]).to_numpy()
+    prof["Team"] = Lm["Team"].to_numpy()
+    prof["Core five"] = Lm["Names"].to_numpy()
+    prof["Minutes"] = Lm["Minutes"].to_numpy()
+    for column in ("NetC", "OffC", "DefC"):
+        prof[column] = Lm[column].to_numpy()
+    era_of = {s: era_for_year(season_start_year(s)) for s in prof["Season"].unique()}
+    prof["Era"] = prof["Season"].map(era_of)
+    prof["weight"] = np.minimum(prof["Minutes"], LINEUP_WEIGHT_CAP)
+
+    # Limits on shared resources, from what real lineups have used.
+    raw = _pools["raw"]
+    rawpos = raw.index.get_indexer(R.ravel()).reshape(R.shape)
+    big = (prof["Minutes"] >= LINEUP_CAP_MIN_MINUTES).to_numpy()
+    caps = dict(_pools["caps"])
+    for name, members in _pools["defs"]:
+        values = raw[members].to_numpy(float)[rawpos]       # lineups x 5 x members
+        totals = np.nansum(values, axis=(1, 2))
+        if big.sum() >= 30:
+            caps[name] = {
+                "cap": float(np.percentile(totals[big], 99)),
+                "typical": float(np.median(totals[big])),
+            }
+    pools = {**_pools, "caps": caps}
+
+    keep = (prof["Minutes"] >= LINEUP_MODEL_MIN_MINUTES).to_numpy()
+    training = prof[keep].reset_index(drop=True)
+    cores = {
+        (s, t): rows.tolist()
+        for s, t, rows in zip(training["Season"], training["Tm"], R[keep])
+    }
+    report["training_lineups"] = len(training)
+    report["training_minutes"] = float(training["Minutes"].sum())
+    return training, cores, {**pools, "cores": cores}, report
+
+
+def legacy_scale_check(df, zfeat, profiles, training, feature_cols, target_label):
+    """How did the older team-based method do on real lineups?
+
+    Fit the old team-level model, apply it to every real lineup, and measure
+    how much its predictions would need to be multiplied by to match what the
+    lineups actually did. That's an empirical version of the bench-dilution
+    guess.
+    """
+    mapping = {
+        "Net rating": ("Net rating (approx.)", 1),
+        "Offense (points scored per 100)": ("Points per 100 poss", 1),
+        "Defense (points prevented per 100)": ("Points allowed per 100 poss (approx.)", -1),
+    }
+    teams = build_team_seasons(df)
+    source, sign = mapping[target_label]
+    if teams.empty or source not in teams.columns or profiles.empty:
+        return None
+
+    team_cols = [c for c in profiles.columns if c not in ("Season", "Tm", "Core five")]
+    if set(team_cols) - set(training.columns):
+        return None
+
+    merged = profiles.merge(teams[["Season", "Tm", "Era", source]], on=["Season", "Tm"], how="left")
+    merged["_target"] = sign * (
+        merged[source] - merged.groupby("Season")[source].transform("mean")
+    )
+    if merged["_target"].notna().sum() < 100:
+        return None
+
+    fitted = fit_builder_models(merged, team_cols, "_target")
+    predicted = _ridge_predict(
+        fitted["additive"]["model"], training[team_cols].to_numpy(float)
+    )
+    actual = training["_target"].to_numpy(float)
+    w = training["weight"].to_numpy(float)
+
+    w = w / w.mean()
+    mp, ma = (w * predicted).sum() / w.sum(), (w * actual).sum() / w.sum()
+    slope = float((w * (predicted - mp) * (actual - ma)).sum() / (w * (predicted - mp) ** 2).sum())
+    corr = weighted_corr(pd.Series(predicted), pd.Series(actual), pd.Series(w))
+    share = top_five_minute_share(df)
+    return {
+        "slope": slope,
+        "corr": corr,
+        "guess": (1.0 / share) if share else None,
+        "n": len(training),
+    }
+
+
+def lineup_history(lineups, player_ids):
+    """Every time this exact five has played together."""
+    key = "-".join(sorted(str(p) for p in player_ids))
+    rows = lineups[lineups["LineupKey"] == key]
+    return rows.sort_values("Minutes", ascending=False)
+
 
 
 # --------------------------------------------------
@@ -3593,12 +4599,13 @@ with lab_tab:
     st.write(
         "Hunt for patterns in the data. Pick a lab: the Player Lab "
         "looks at what players do, the Team Lab looks at how whole "
-        "teams play, and the Pair Lab looks at two-player combinations."
+        "teams play, the Pair Lab looks at two-player combinations, and "
+        "the Lineup Lab looks at real five-man lineups."
     )
 
     lab_choice = st.selectbox(
         "Choose a lab",
-        ["Player Lab", "Team Lab", "Pair Lab"],
+        ["Player Lab", "Team Lab", "Pair Lab", "Lineup Lab"],
         key="lab_choice",
     )
 
@@ -4013,8 +5020,10 @@ with lab_tab:
                 )
 
 
-    else:
+    elif lab_choice == "Pair Lab":
         render_pair_lab(df)
+    else:
+        render_lineup_lab(df)
 
 # --------------------------------------------------
 # TEAM BUILDER
