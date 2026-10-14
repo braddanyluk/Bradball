@@ -1356,7 +1356,10 @@ def render_team_builder(df, player_labels, player_options):
         try:
             loaded, loaded_report = load_lineups()
             if loaded is None:
-                lineup_problem = "; ".join(loaded_report["problems"])
+                lineup_problem = (
+                    "; ".join(loaded_report["problems"])
+                    + " (Data Lab, then Lineup Lab, shows what's in the files.)"
+                )
             else:
                 lineup_data = loaded
         except Exception as error:
@@ -3583,6 +3586,101 @@ def _lineup_cache_key():
     return tuple(stamps)
 
 
+# Other names the same columns often go by (matched ignoring case and spaces).
+_LINEUP_ALIASES = {
+    "Season": ["season", "seasonyear", "season_year"],
+    "SeasonType": ["seasontype", "season_type"],
+    "Team": ["team", "teamabbreviation", "team_abbreviation", "teamabbr", "tm", "teamname"],
+    "TeamId": ["teamid", "team_id"],
+    "Minutes": ["minutes", "min", "mins", "minutesplayed", "minutes_played"],
+    "OffRtg": ["offrtg", "off_rtg", "offrating", "off_rating", "ortg", "offensiverating"],
+    "DefRtg": ["defrtg", "def_rtg", "defrating", "def_rating", "drtg", "defensiverating"],
+    "NetRtg": ["netrtg", "net_rtg", "netrating", "net_rating", "nrtg"],
+    "Fg3Pct": ["fg3pct", "fg3_pct", "fg3%", "3p%", "threepct"],
+    "Fg2Pct": ["fg2pct", "fg2_pct", "fg2%", "2p%"],
+    "OppFg3Pct": ["oppfg3pct", "opp_fg3pct", "oppfg3%", "opp3p%"],
+    "OppFg2Pct": ["oppfg2pct", "opp_fg2pct", "oppfg2%", "opp2p%"],
+}
+
+_LINEUP_ID_HINTS = {
+    "lineupid", "lineupids", "lineup", "groupid", "playerids",
+    "players", "rowid", "on",
+}
+
+
+def _apply_lineup_aliases(d):
+    lowered = {}
+    for column in d.columns:
+        lowered.setdefault(str(column).lower().replace(" ", ""), column)
+    renames = {}
+    for canonical, options in _LINEUP_ALIASES.items():
+        if canonical in d.columns:
+            continue
+        for option in options:
+            original = lowered.get(option)
+            if original is not None and original not in renames and original not in _LINEUP_ALIASES:
+                renames[original] = canonical
+                break
+    return d.rename(columns=renames) if renames else d
+
+
+def _extract_lineup_ids(d):
+    """Find the five player IDs wherever the file keeps them.
+
+    Handles five separate columns, or one column that holds all five (for
+    example 'On:123,456,...' or '123-456-...'). Returns (ids, description);
+    ids has one row per row of d, with blanks where there weren't five.
+    """
+    explicit = [f"Player{i}Id" for i in range(1, 6)]
+    if all(c in d.columns for c in explicit):
+        return d[explicit].apply(_clean_id), "Player1Id..Player5Id"
+
+    # Five separate columns under other names.
+    lowered = {str(c).lower().replace("_", "").replace(" ", ""): c for c in d.columns}
+    for pattern in ("player{i}id", "player{i}", "p{i}id", "p{i}", "playerid{i}"):
+        wanted = [pattern.format(i=i) for i in range(1, 6)]
+        if all(w in lowered for w in wanted):
+            columns = [lowered[w] for w in wanted]
+            sample = d[columns].head(300).astype(str)
+            if sample.apply(lambda s: s.str.fullmatch(r"\d+(\.0)?")).all().all():
+                return d[columns].apply(_clean_id), ", ".join(columns)
+
+    # One column holding all five.
+    best = None
+    for column in d.columns:
+        if column == "_file":
+            continue
+        values = d[column].dropna().astype(str).head(2000)
+        if values.empty:
+            continue
+        tokens = values.str.findall(r"\d+")
+        five = (
+            tokens.map(len).eq(5)
+            & values.str.contains(r"\D")
+            & tokens.map(lambda t: all(len(x) >= 2 for x in t))
+        )
+        share = float(five.mean())
+        if share < 0.3:
+            continue
+        hinted = str(column).lower().replace("_", "").replace(" ", "") in _LINEUP_ID_HINTS
+        # An ID column is mostly digits; a column of names is mostly letters.
+        letters = float(
+            (values.str.count(r"[A-Za-z]") / values.str.len().clip(lower=1)).mean()
+        )
+        score = (round(share, 2), hinted, -round(letters, 2))
+        if best is None or score > best[0]:
+            best = (score, column)
+
+    if best is None:
+        return None, None
+
+    column = best[1]
+    tokens = d[column].astype(str).str.findall(r"\d+")
+    keep = tokens.map(len) == 5
+    ids = pd.DataFrame(tokens[keep].tolist(), index=d.index[keep]).reindex(d.index)
+    return ids.apply(_clean_id), f"the '{column}' column"
+
+
 @st.cache_data(show_spinner="Loading five-man lineup data...")
 def load_lineups():
     """Combine and clean the lineup files. Returns (data, report).
@@ -3610,37 +3708,43 @@ def load_lineups():
     d = pd.concat(frames, ignore_index=True)
     report["rows_raw"] = len(d)
 
-    # ---- the five players ----
-    player_columns = [f"Player{i}Id" for i in range(1, 6)]
-    if all(c in d.columns for c in player_columns):
-        ids = d[player_columns].apply(_clean_id)
-    elif "LineupId" in d.columns:
-        split = (
-            d["LineupId"].astype(str).str.replace(",", "-", regex=False)
-            .str.split("-", expand=True)
-        )
-        if split.shape[1] < 5:
-            report["problems"].append("LineupId doesn't contain five player IDs.")
-            return None, report
-        ids = split.iloc[:, :5].apply(_clean_id)
-        report["notes"].append("Players were read from LineupId.")
-    else:
-        report["problems"].append("No Player1Id..Player5Id or LineupId columns.")
-        return None, report
+    d = _apply_lineup_aliases(d)
+    report["columns"] = [c for c in d.columns if c != "_file"]
+    report["head"] = d.head(3).drop(columns=["_file"])
 
-    if "Minutes" not in d.columns:
-        report["problems"].append("No Minutes column.")
+    # ---- the five players ----
+    ids, how = _extract_lineup_ids(d)
+    if ids is None:
+        report["problems"].append(
+            "Couldn't find the five player IDs in the lineup files. The "
+            "columns are: " + ", ".join(report["columns"]) + ". Open "
+            "'What's in the files' below and send it to Claude."
+        )
+        return None, report
+    report["notes"].append(f"Players were read from {how}.")
+
+    missing = [c for c in ("Season", "Minutes") if c not in d.columns]
+    if "Team" not in d.columns and "TeamId" not in d.columns:
+        missing.append("Team or TeamId")
+    if missing:
+        report["problems"].append(
+            "The lineup files are missing: " + ", ".join(missing) + ". "
+            "The columns are: " + ", ".join(report["columns"]) + "."
+        )
         return None, report
 
     # ---- identity columns ----
-    d["Season"] = d["Season"].astype("string").str.strip() if "Season" in d.columns else pd.NA
+    d["Season"] = d["Season"].astype("string").str.strip()
     d["SeasonType"] = (
         d["SeasonType"].astype("string").str.strip()
         if "SeasonType" in d.columns else "Regular Season"
     )
-    d["TeamId"] = _clean_id(d["TeamId"]) if "TeamId" in d.columns else pd.NA
+    if "TeamId" in d.columns:
+        d["TeamId"] = _clean_id(d["TeamId"])
     if "Team" not in d.columns:
         d["Team"] = d["TeamId"]
+    if "TeamId" not in d.columns:
+        d["TeamId"] = d["Team"].astype("string")
     d["Team"] = d["Team"].astype("string").str.strip()
 
     for column in ["Minutes"] + LINEUP_RATES + LINEUP_PCTS:
@@ -3973,6 +4077,9 @@ def _lineup_checks(lineups, report):
             f"{report['net_mismatch_share']:.0%} of rows have a NetRtg that "
             "doesn't equal OffRtg minus DefRtg (beyond rounding)."
         )
+    if report.get("columns"):
+        with st.expander("Columns found in the files"):
+            st.code(", ".join(report["columns"]))
 
     st.markdown("#### Evidence tiers")
     tiers = (lineups["Sample"].value_counts()
@@ -3992,6 +4099,21 @@ def _lineup_checks(lineups, report):
         "Minutes per team well below ~3,900 means lineups involving players "
         "outside the downloaded top group aren't represented."
     )
+
+
+def _lineup_file_diagnostics():
+    """Column names and first rows of each lineup file, straight from disk."""
+    for path in LINEUP_FILES:
+        if not path.exists():
+            st.caption(f"{path.name}: not found")
+            continue
+        try:
+            head = pd.read_csv(path, compression="gzip", dtype=str, nrows=3)
+            st.markdown(f"**{path.name}**")
+            st.code(", ".join(map(str, head.columns)))
+            st.dataframe(head, use_container_width=True, hide_index=True)
+        except Exception as error:
+            st.caption(f"{path.name}: couldn't be read ({error})")
 
 
 def render_lineup_lab(df):
@@ -4017,6 +4139,8 @@ def render_lineup_lab(df):
         return
     if lineups is None:
         st.error("; ".join(report["problems"]))
+        with st.expander("What's in the files (send this to Claude)", expanded=True):
+            _lineup_file_diagnostics()
         return
 
     look_tab, explore_tab, checks_tab = st.tabs(
