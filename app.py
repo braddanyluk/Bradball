@@ -307,7 +307,7 @@ def career_summary(player_rows):
 # DATA LOADING
 # --------------------------------------------------
 
-@st.cache_data
+@st.cache_resource
 def load_data():
     data = pd.read_csv(
         DATA_FILE,
@@ -905,7 +905,7 @@ def _player_feature_z(data):
     return z.clip(-3.5, 3.5).fillna(0), raw, mean, std
 
 
-@st.cache_data(show_spinner="Building lineup profiles...")
+@st.cache_data(show_spinner="Building lineup profiles...", max_entries=1)
 def builder_tables(data):
     """Player z-scores, a 'core five' profile per team-season, and the
     historical limits on shared resources."""
@@ -1161,7 +1161,7 @@ def _fit_variant_blocked(X, y, w, season_index, season_fold, k, alphas):
     return alpha, sse, oof, model, boot
 
 
-@st.cache_data(show_spinner="Fitting the model across seasons...")
+@st.cache_data(show_spinner="Fitting the model across seasons...", max_entries=2)
 def fit_builder_models(profiles, feature_cols, target_col, weight_col=None, carry_cols=()):
     """Fit additive and interaction models, scored on unseen seasons.
 
@@ -2407,7 +2407,7 @@ def _read_name_lookup():
         return pd.Series(dtype="string")
 
 
-@st.cache_data(show_spinner="Loading player-pair data...")
+@st.cache_data(show_spinner="Loading player-pair data...", max_entries=1)
 def load_pairs():
     """Load and clean the pair file. Returns (data, report).
 
@@ -3919,7 +3919,7 @@ def _extract_lineup_ids(d):
     return ids.apply(_clean_id), f"the '{column}' column"
 
 
-@st.cache_data(show_spinner="Loading five-man lineup data...")
+@st.cache_data(show_spinner="Loading five-man lineup data...", max_entries=1)
 def load_lineups():
     """Combine and clean the lineup files. Returns (data, report).
 
@@ -4396,7 +4396,7 @@ def render_lineup_lab(df):
 # LINEUP MODEL INPUTS (used by the Team Builder)
 # --------------------------------------------------
 
-@st.cache_data(show_spinner="Building lineup profiles from real lineups...")
+@st.cache_data(show_spinner="Building lineup profiles from real lineups...", max_entries=1)
 def build_lineup_training(_data, _lineups, _zfeat, _pools, base_cols, cache_key):
     """Skill profile for every real lineup, plus limits on shared resources.
 
@@ -5401,3 +5401,4 @@ st.markdown(
     '</div>',
     unsafe_allow_html=True
 )
+
