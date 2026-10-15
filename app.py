@@ -395,6 +395,19 @@ def load_data():
                 values.div(denominator).mul(100)
             ).where(denominator > 0).round(2)
 
+    # Keep the full dataset, but use compact storage for the many numeric columns.
+    # Float32 is sufficient for these displayed and modeled statistics.
+    for column in data.select_dtypes(include=["integer"]).columns:
+        data[column] = pd.to_numeric(data[column], downcast="integer")
+    for column in data.select_dtypes(include=["floating"]).columns:
+        data[column] = pd.to_numeric(data[column], downcast="float")
+
+    # These labels repeat across player-seasons; categorical storage avoids
+    # keeping a separate copy of each string in every row.
+    for column in ("player_id", "player_name"):
+        if column in data.columns:
+            data[column] = data[column].astype("category")
+
     return data
 
 
@@ -5053,7 +5066,7 @@ with lab_tab:
             "PTS", "TRB", "AST", "STL", "BLK", "TOV", "MP", "G",
         }
 
-        numeric_data = pd.DataFrame(index=lab_df.index)
+        numeric_columns = {}
 
         for column in lab_df.columns:
             if column.lower() in excluded_names or column in alias_columns:
@@ -5072,7 +5085,9 @@ with lab_tab:
             if values.nunique(dropna=True) < 2:
                 continue
 
-            numeric_data[column] = values
+            numeric_columns[column] = values
+
+        numeric_data = pd.DataFrame(numeric_columns, index=lab_df.index)
 
         if within_season and "Season" in lab_df.columns and len(numeric_data.columns):
             numeric_data = within_group_z(numeric_data, lab_df["Season"])
@@ -5401,4 +5416,9 @@ st.markdown(
     '</div>',
     unsafe_allow_html=True
 )
+
+
+
+
+
 
