@@ -2476,7 +2476,7 @@ def load_pairs():
 
     for column in ["Minutes"] + PAIR_RATES + PAIR_PCTS:
         if column in d.columns:
-            d[column] = pd.to_numeric(d[column], errors="coerce")
+            d[column] = pd.to_numeric(d[column], errors="coerce", downcast="float")
         else:
             d[column] = np.nan
             report["notes"].append(f"Column {column} not in file; left blank.")
@@ -3956,7 +3956,7 @@ def load_lineups():
         if not path.exists():
             report["files"].append((path.name, None))
             continue
-        part = pd.read_csv(path, compression="gzip", dtype=str, low_memory=False)
+        part = pd.read_csv(path, compression="gzip", low_memory=False)
         part.columns = [str(c).strip() for c in part.columns]
         part["_file"] = path.name
         frames.append(part)
@@ -3966,7 +3966,9 @@ def load_lineups():
         report["problems"].append("None of the lineup files were found.")
         return None, report
 
-    d = pd.concat(frames, ignore_index=True)
+    d = pd.concat(frames, ignore_index=True, copy=False)
+    frames.clear()
+    del part
     report["rows_raw"] = len(d)
 
     d = _apply_lineup_aliases(d)
@@ -3994,6 +3996,13 @@ def load_lineups():
         )
         return None, report
 
+    # Keep only columns used by the builder and Lineup Lab. The raw column
+    # names and sample rows are already saved in the diagnostic report above.
+    needed_columns = {"Season", "SeasonType", "Team", "TeamId", "Minutes", "_file"}
+    needed_columns.update(LINEUP_RATES)
+    needed_columns.update(LINEUP_PCTS)
+    d = d[[c for c in d.columns if c in needed_columns]]
+
     # ---- identity columns ----
     d["Season"] = d["Season"].astype("string").str.strip()
     d["SeasonType"] = (
@@ -4010,7 +4019,7 @@ def load_lineups():
 
     for column in ["Minutes"] + LINEUP_RATES + LINEUP_PCTS:
         if column in d.columns:
-            d[column] = pd.to_numeric(d[column], errors="coerce")
+            d[column] = pd.to_numeric(d[column], errors="coerce", downcast="float")
         else:
             d[column] = np.nan
             report["notes"].append(f"Column {column} not in the files; left blank.")
@@ -5439,19 +5448,6 @@ st.markdown(
     '</div>',
     unsafe_allow_html=True
 )
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
