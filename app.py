@@ -1,5 +1,6 @@
 import html
 import re
+import zlib
 
 import numpy as np
 import pandas as pd
@@ -1570,13 +1571,14 @@ def render_team_builder(df, player_labels, player_options):
         )
 
     use_pair_layer = False
+    blend_history = False
     if pair_layer is not None and pair_layer.get("ok"):
         bt = pair_layer["backtest"]
         st.markdown("#### Pair chemistry layer")
         if "r2_with" in bt:
             p1, p2, p3 = st.columns(3)
-            p1.metric("Without pair layer (unseen seasons)", f"{bt['r2_without']:.1%}")
-            p2.metric("With pair layer (unseen seasons)", f"{bt['r2_with']:.1%}")
+            p1.metric("Without pair layer", f"{bt['r2_without']:.1%}")
+            p2.metric("With pair layer", f"{bt['r2_with']:.1%}")
             p3.metric(
                 "How much shows up",
                 f"{bt['lam']:.2f}x",
@@ -1585,18 +1587,19 @@ def render_team_builder(df, player_labels, player_options):
             )
             if bt["helps"]:
                 st.success(
-                    f"Adding pair chemistry improved predictions of unseen "
-                    f"seasons from {bt['r2_without']:.1%} to "
-                    f"{bt['r2_with']:.1%}. About {bt['lam']:.0%} of the summed "
-                    "pair chemistry shows up in results, so it's scaled "
-                    "by that."
+                    f"Adding pair chemistry improved predictions from "
+                    f"{bt['r2_without']:.1%} to {bt['r2_with']:.1%}, with "
+                    "every pair scored by a model that never saw that pair's "
+                    f"own results. About {bt['lam']:.0%} of the summed "
+                    "chemistry shows up in results, so it's scaled by that."
                 )
             else:
                 st.info(
                     "Adding pair chemistry did not clearly improve "
-                    "predictions of unseen seasons, so it's off by default. "
-                    "That's informative: pair-level skill fit may be too "
-                    "noisy to matter, or the player stats may not capture "
+                    "predictions, so it's off by default. Every pair is "
+                    "scored by a model that never saw that pair's own "
+                    "results, so this is a fair test: skill fit alone may "
+                    "not add much here, or the player stats may not capture "
                     "what drives it."
                 )
             use_pair_layer = st.checkbox(
@@ -1604,6 +1607,16 @@ def render_team_builder(df, player_labels, player_options):
                 value=bool(bt["helps"]),
                 key=f"builder_pair_layer_{target_label}",
             )
+            if use_pair_layer:
+                blend_history = st.checkbox(
+                    "Also let each pair's real history raise or lower its score "
+                    "(hindsight)",
+                    value=False,
+                    key=f"builder_pair_history_{target_label}",
+                    help="Off by default. With it on, a duo that happened to "
+                         "do well together gets a bonus for it, even if "
+                         "their skills wouldn't predict that.",
+                )
         else:
             st.caption(
                 "Not enough overlapping team-seasons to backtest the pair "
@@ -1842,10 +1855,11 @@ def render_team_builder(df, player_labels, player_options):
         pair_table, synergy_effect = None, 0.0
         if use_pair_layer:
             pair_table = lineup_pair_synergy(
-                df, zfeat, pair_layer, selected_rows, base_cols
+                df, zfeat, pair_layer, selected_rows, base_cols,
+                use_history=blend_history,
             )
             synergy_effect = float(
-                pair_layer["backtest"]["lam"] * pair_table["Blended"].sum()
+                pair_layer["backtest"]["lam"] * pair_table["Used"].sum()
             )
 
         best_seen, worst_seen = results["reference"]
@@ -2058,10 +2072,9 @@ def render_team_builder(df, player_labels, player_options):
             st.write(
                 "Ten pairs share the floor in a lineup. 'Skills predict' is "
                 "how well each pair's skills fit together, beyond how good "
-                "each player is on his own. Where these two players have "
-                "actually shared the floor, 'Observed' is how that pair "
-                "deviated from its parts, and the blend leans on it more as "
-                "shared minutes grow."
+                "each player is on his own, scored by a model that never saw "
+                "that pair's own results. 'Real history' is how the pair "
+                "actually deviated from its parts, shown for context."
             )
             shown_pairs = pair_table.assign(
                 **{"Shared minutes": pair_table["Shared minutes"].round(0)}
@@ -2070,22 +2083,25 @@ def render_team_builder(df, player_labels, player_options):
                 shown_pairs.style.format({
                     "Skills predict": "{:+.2f}",
                     "Shared minutes": "{:.0f}",
-                    "Observed": "{:+.2f}",
-                    "Blended": "{:+.2f}",
+                    "Real history": "{:+.2f}",
+                    "Used": "{:+.2f}",
                 }, na_rep="—"),
                 use_container_width=True,
                 hide_index=True,
             )
 
-            best_pair = pair_table.loc[pair_table["Blended"].idxmax()]
-            worst_pair = pair_table.loc[pair_table["Blended"].idxmin()]
+            best_pair = pair_table.loc[pair_table["Used"].idxmax()]
+            worst_pair = pair_table.loc[pair_table["Used"].idxmin()]
             st.caption(
-                f"Best fit: {best_pair['Pair']} ({best_pair['Blended']:+.2f}). "
-                f"Worst fit: {worst_pair['Pair']} ({worst_pair['Blended']:+.2f}). "
+                f"Best fit: {best_pair['Pair']} ({best_pair['Used']:+.2f}). "
+                f"Worst fit: {worst_pair['Pair']} ({worst_pair['Used']:+.2f}). "
                 f"Total chemistry across the 10 pairs: "
-                f"{pair_table['Blended'].sum():+.2f}, scaled by "
+                f"{pair_table['Used'].sum():+.2f}, scaled by "
                 f"{pair_layer['backtest']['lam']:.2f} to {synergy_effect:+.2f} "
-                "per 100 in the prediction."
+                "per 100 in the prediction. "
+                + ("Each pair's real history was blended in."
+                   if blend_history else
+                   "Real history is shown but not used.")
             )
 
         if lineup_data is not None:
@@ -2112,8 +2128,11 @@ def render_team_builder(df, player_labels, player_options):
                 h1.metric("What actually happened", f"{observed:+.1f}",
                           help="Minutes-weighted, relative to a league-average team.")
                 h2.metric("Minutes together", f"{minutes_together:,.0f}")
-                h3.metric("Blended with the estimate", f"{blended_history:+.1f}",
-                          help="Leans on real history more as minutes grow.")
+                h3.metric("Estimate if history were blended in", f"{blended_history:+.1f}",
+                          help="For comparison only. It is not part of the "
+                               "prediction above, which doesn't use this "
+                               "lineup's own results. Leans on history more "
+                               "as minutes grow.")
                 st.dataframe(
                     same_five[["Season", "Team", "Minutes", "Sample", "NetRtg", "OffRtg", "DefRtg"]]
                     .rename(columns={"NetRtg": "Net", "OffRtg": "Off", "DefRtg": "Def"})
@@ -2989,14 +3008,22 @@ def render_pair_lab(df):
 # --------------------------------------------------
 # PAIR SYNERGY LAYER
 # --------------------------------------------------
-# Idea: a pair's net rating (relative to its team) is mostly explained by
-# how good each player is. What's left over is "how this pair did beyond its
-# individual parts". We learn which skill combinations predict that leftover,
-# then add up the expected leftover across the 10 pairs in a lineup.
+# A pair's net rating (relative to its team) is mostly explained by how good
+# each player is. What's left over is how the pair did beyond its parts.
+#
+# The model learns which SHAPES of skill profile fit together: a symmetric
+# compatibility matrix M over the skills, so chemistry(A, B) = zA' M zB. It
+# never sees player IDs or teams, so two players who never met are scored
+# exactly like any other pair. Outcomes are the training signal (the only place
+# "what fits" can be learned), but every pair in a lineup is scored by a model
+# that never saw that pair's own results, and the model is validated on pairs
+# and players it was never shown.
 
 PAIR_MODEL_MIN_MINUTES = 100       # pairs below this are too noisy to learn from
 PAIR_PLAYER_RIDGE = 100.0          # shrinkage on each player-season's own effect
 PAIR_MODEL_ALPHAS = [10, 100, 1_000, 10_000, 100_000]
+PAIR_FOLDS = 5                      # ways to hold out pairs and players
+PAIR_RANKS = [1, 2, 3, 4, 6, 8]     # skill axes to try (plus all of them)
 PAIR_EVIDENCE_MINUTES = 600        # shared minutes at which observed results get half the weight
 PAIR_MIN_SKILL_MATCH = 0.5         # need this share of pair rows matched to player stats
 
@@ -3033,25 +3060,93 @@ def _skill_row_lookup(data):
     return pd.Series(best.index.to_numpy(), index=best["key"].to_numpy())
 
 
+def _fold_of_key(key, folds=PAIR_FOLDS):
+    """A stable fold for a name (same answer every run, unlike hash())."""
+    return zlib.crc32(str(key).encode("utf-8")) % folds
+
+
+def _pair_key(a, b):
+    a, b = str(a), str(b)
+    return f"{a}|{b}" if a <= b else f"{b}|{a}"
+
+
 def _pair_feature_names(features):
     count = len(features)
     rows, cols = np.triu_indices(count, k=1)
-    names = [f"Both high or both low on {f}" for f in features]
-    names += [f"One is high and one is low on {f}" for f in features]
+    names = [f"Both high on {f} (or both low)" for f in features]
     names += [f"One has {features[i]}, the other has {features[j]}"
               for i, j in zip(rows, cols)]
     return names
 
 
 def _pair_features(za, zb):
-    """Order-free ways two skill profiles can fit together."""
+    """The ways one player's skills can pair with the other's.
+
+    Every term is a product of one skill from each player, written so the
+    answer doesn't depend on which is called A and which B. A fitted weight
+    on each term is one entry of a symmetric skill-compatibility matrix.
+    """
     count = za.shape[1]
     rows, cols = np.triu_indices(count, k=1)
     return np.hstack([
-        za * zb,                                         # same skill, both high/low
-        np.abs(za - zb),                                 # one high, one low
-        za[:, rows] * zb[:, cols] + za[:, cols] * zb[:, rows],  # A has f, B has g
+        za * zb,                                                 # same skill, both
+        za[:, rows] * zb[:, cols] + za[:, cols] * zb[:, rows],   # different skills
     ])
+
+
+def _geometry_matrix(weights, count):
+    """Weights on the pair features -> symmetric compatibility matrix M."""
+    M = np.zeros((count, count))
+    M[np.diag_indices(count)] = weights[:count]
+    rows, cols = np.triu_indices(count, k=1)
+    M[rows, cols] = weights[count:]
+    M[cols, rows] = weights[count:]
+    return M
+
+
+def _weights_from_matrix(M):
+    rows, cols = np.triu_indices(M.shape[0], k=1)
+    return np.concatenate([np.diag(M), M[rows, cols]])
+
+
+def _truncate_geometry(M, rank):
+    """Keep only the `rank` strongest axes of the compatibility matrix."""
+    if rank is None or rank >= M.shape[0]:
+        return M
+    values, vectors = np.linalg.eigh(M)
+    keep = np.argsort(-np.abs(values))[:rank]
+    return (vectors[:, keep] * values[keep]) @ vectors[:, keep].T
+
+
+def _bilinear(za, zb, M):
+    """chemistry(A, B) = zA' M zB, for many pairs at once."""
+    return ((za @ M) * zb).sum(axis=1)
+
+
+def _geometry_axes(M, features, top=3):
+    """The axes of skill space the compatibility matrix is built from.
+
+    Along an axis, a pair's chemistry is (strength) x (A's score) x (B's
+    score). A positive strength rewards players who sit on the same side;
+    a negative strength rewards players on opposite sides (complements).
+    """
+    values, vectors = np.linalg.eigh(M)
+    axes = []
+    for index in np.argsort(-np.abs(values)):
+        if abs(values[index]) < 1e-9:
+            continue
+        vector = vectors[:, index]
+        if vector[np.argmax(np.abs(vector))] < 0:
+            vector = -vector
+        order = np.argsort(-vector)
+        axes.append({
+            "value": float(values[index]),
+            "strength": float(abs(values[index])),
+            "kind": "complement" if values[index] < 0 else "reinforce",
+            "high": [features[i] for i in order[:top] if vector[i] > 0.15],
+            "low": [features[i] for i in order[::-1][:top] if vector[i] < -0.15],
+        })
+    return axes
 
 
 def _pair_residuals(pairs):
@@ -3077,13 +3172,21 @@ def _pair_residuals(pairs):
     return residual
 
 
-def _fit_pair_core(pairs, za, zb):
-    """Weighted ridge of pair deviation on skill-fit features, scored on
-    seasons the model never saw."""
+def _fit_pair_geometry(pairs, za, zb):
+    """Learn a skill-compatibility matrix, validated three ways.
+
+    The three scores answer different questions:
+      season  - new seasons, but the same players and pairs (flatters it)
+      pair    - a pair it never saw, though it saw each player with others
+      player  - two players it never saw at all (the real test of geometry)
+    Settings are chosen on the strictest test that has enough data, so the
+    model is rewarded for generalizing to strangers, not for memorizing.
+    """
+    count = za.shape[1]
     X = _pair_features(za, zb)
     y = pairs["e"].to_numpy(float)
-    w = pairs["Minutes"].to_numpy(float)
-    w = w / w.mean()
+    minutes = pairs["Minutes"].to_numpy(float)
+    w = minutes / minutes.mean()
     total_w = w.sum()
 
     mu = (X * w[:, None]).sum(axis=0) / total_w
@@ -3091,83 +3194,154 @@ def _fit_pair_core(pairs, za, zb):
     sd[sd == 0] = 1.0
     Z = (X - mu) / sd
 
+    id_a, id_b = pairs["PlayerA"].to_numpy(), pairs["PlayerB"].to_numpy()
     seasons = pairs["Season"].to_numpy()
-    unique = sorted(set(seasons))
-    k = min(5, len(unique))
-    fold_of = {s: i % k for i, s in enumerate(unique)}
-    folds = np.array([fold_of[s] for s in seasons])
 
-    def stats(mask):
-        Zt, yt, wt = Z[mask], y[mask], w[mask]
+    unique_seasons = sorted(set(seasons))
+    k_season = min(PAIR_FOLDS, len(unique_seasons))
+    season_fold_of = {s: i % k_season for i, s in enumerate(unique_seasons)}
+    season_fold = np.array([season_fold_of[s] for s in seasons])
+    pair_fold = np.array([_fold_of_key(_pair_key(a, b)) for a, b in zip(id_a, id_b)])
+    player_fold_of = {p: _fold_of_key(p) for p in set(id_a) | set(id_b)}
+    fold_a = np.array([player_fold_of[p] for p in id_a])
+    fold_b = np.array([player_fold_of[p] for p in id_b])
+
+    schemes = {
+        "season": [(season_fold != f, season_fold == f) for f in range(k_season)]
+        if k_season >= 2 else [],
+        "pair": [(pair_fold != f, pair_fold == f) for f in range(PAIR_FOLDS)],
+        "player": [((fold_a != f) & (fold_b != f), (fold_a == f) & (fold_b == f))
+                   for f in range(PAIR_FOLDS)],
+    }
+
+    def stats(train):
+        Zt, yt, wt = Z[train], y[train], w[train]
         wsum = wt.sum()
         zbar = (wt[:, None] * Zt).sum(axis=0) / wsum
         y_mean = (wt * yt).sum() / wsum
         Zc = Zt - zbar
-        return Zc.T @ (Zc * wt[:, None]), Zc.T @ (wt * (yt - y_mean)), zbar
+        return Zc.T @ (Zc * wt[:, None]), Zc.T @ (wt * (yt - y_mean))
 
-    def solve(A, b, alpha):
-        return np.linalg.solve(A + alpha * np.eye(A.shape[0]), b)
+    scheme_stats = {
+        name: [stats(tr) if tr.sum() >= 200 and te.sum() >= 50 else None
+               for tr, te in folds]
+        for name, folds in schemes.items()
+    }
 
-    fold_stats = [stats(folds != f) for f in range(k)]
+    def matrix_for(A, b, alpha, rank):
+        coef = np.linalg.solve(A + alpha * np.eye(A.shape[0]), b)
+        return _truncate_geometry(_geometry_matrix(coef / sd, count), rank)
+
+    def centered_offset(M, train):
+        return float((w[train] * _bilinear(za[train], zb[train], M)).sum() / w[train].sum())
+
+    def evaluate(name, alpha, rank):
+        oof = np.full(len(y), np.nan)
+        for f, (train, test) in enumerate(schemes[name]):
+            entry = scheme_stats[name][f]
+            if entry is None:
+                continue
+            M = matrix_for(entry[0], entry[1], alpha, rank)
+            oof[test] = _bilinear(za[test], zb[test], M) - centered_offset(M, train)
+        tested = ~np.isnan(oof)
+        sse = float((w[tested] * (y[tested] - oof[tested]) ** 2).sum())
+        sst = float((w[tested] * y[tested] ** 2).sum())
+        return sse, sst, oof
+
+    # Choose settings on the strictest test that has enough data.
+    chosen_scheme = "player"
+    if sum(e is not None for e in scheme_stats["player"]) < 3:
+        chosen_scheme = "pair"
+
     best = None
     for alpha in PAIR_MODEL_ALPHAS:
-        oof = np.zeros(len(y))
-        for f in range(k):
-            A, b, zbar = fold_stats[f]
-            test = folds == f
-            oof[test] = (Z[test] - zbar) @ solve(A, b, alpha)
-        sse = float((w * (y - oof) ** 2).sum())
+        sse, sst, _ = evaluate(chosen_scheme, alpha, None)
         if best is None or sse < best[0]:
-            best = (sse, alpha, oof)
-    sse, alpha, oof = best
+            best = (sse, sst, alpha)
+    _, sst_chosen, alpha = best
 
-    total = float((w * y ** 2).sum())
+    rank_scores = {}
+    for rank in PAIR_RANKS + [None]:
+        rank_scores[rank], _, _ = evaluate(chosen_scheme, alpha, rank)
+    best_sse = min(rank_scores.values())
+    rank = None
+    for candidate in PAIR_RANKS + [None]:
+        # Prefer the simplest geometry that's within a hair of the best.
+        if rank_scores[candidate] <= best_sse + 0.002 * sst_chosen:
+            rank = candidate
+            break
+
+    validation = {"rank": rank, "alpha": alpha, "chosen_on": chosen_scheme}
     solid = pairs["Minutes"].to_numpy(float) >= 500
-    solid_total = float((w[solid] * y[solid] ** 2).sum())
-    solid_sse = float((w[solid] * (y[solid] - oof[solid]) ** 2).sum())
+    for name in ("season", "pair", "player"):
+        if not schemes[name]:
+            validation[name] = float("nan")
+            continue
+        sse, sst, oof = evaluate(name, alpha, rank)
+        validation[name] = 1 - sse / sst if sst > 0 else float("nan")
+        validation[f"{name}_rows"] = int((~np.isnan(oof)).sum())
+        if name == "player":
+            ok = solid & ~np.isnan(oof)
+            s_sst = float((w[ok] * y[ok] ** 2).sum())
+            validation["player_solid"] = (
+                1 - float((w[ok] * (y[ok] - oof[ok]) ** 2).sum()) / s_sst if s_sst > 0 else float("nan")
+            )
 
-    A_all, b_all, zbar_all = stats(np.ones(len(y), dtype=bool))
-    full = (zbar_all, solve(A_all, b_all, alpha))
-    fold_models = [
-        (fold_stats[f][2], solve(fold_stats[f][0], fold_stats[f][1], alpha))
-        for f in range(k)
-    ]
+    # Final model on everything, plus one model per pair-fold. A pair in a
+    # lineup is later scored by the model that never saw that pair's results.
+    everything = np.ones(len(y), dtype=bool)
+    A_all, b_all = stats(everything)
+    M_raw = matrix_for(A_all, b_all, alpha, None)
+    M_full = _truncate_geometry(M_raw, rank)
+    full = {"M": M_full, "b": -centered_offset(M_full, everything)}
+
+    pair_models = []
+    for f, (train, _) in enumerate(schemes["pair"]):
+        entry = scheme_stats["pair"][f]
+        if entry is None:
+            pair_models.append(full)
+            continue
+        M_f = matrix_for(entry[0], entry[1], alpha, rank)
+        pair_models.append({"M": M_f, "b": -centered_offset(M_f, train)})
 
     # Do the patterns hold up in two independent halves of the seasons?
-    order = {s: i for i, s in enumerate(unique)}
+    order = {s: i for i, s in enumerate(unique_seasons)}
     first_half = np.array([order[s] % 2 == 0 for s in seasons])
     halves = None
     if first_half.sum() >= 200 and (~first_half).sum() >= 200:
         h1, h2 = stats(first_half), stats(~first_half)
-        halves = (solve(h1[0], h1[1], alpha), solve(h2[0], h2[1], alpha))
+        halves = (
+            matrix_for(h1[0], h1[1], alpha, None),
+            matrix_for(h2[0], h2[1], alpha, None),
+        )
 
     return {
         "alpha": alpha,
-        "r2": 1 - sse / total if total > 0 else float("nan"),
-        "r2_solid": 1 - solid_sse / solid_total if solid_total > 0 else float("nan"),
+        "rank": rank,
         "n": len(y),
-        "n_seasons": len(unique),
-        "fold_of": fold_of,
-        "mu": mu,
-        "sd": sd,
+        "n_seasons": len(unique_seasons),
+        "n_players": len(player_fold_of),
+        "validation": validation,
         "full": full,
-        "folds": fold_models,
+        "pair_models": pair_models,
+        "M_raw": M_raw,
         "halves": halves,
     }
 
 
 def _pair_predict(model, za, zb, fold=None):
-    """Expected pair-specific deviation (net rating points per 100)."""
-    X = _pair_features(za, zb)
-    Z = (X - model["mu"]) / model["sd"]
-    zbar, coef = model["full"] if fold is None else model["folds"][fold]
-    return (Z - zbar) @ coef
+    """Expected pair-specific deviation (net rating points per 100).
+
+    With a fold, uses the model trained without that fold's pairs.
+    """
+    entry = model["full"] if fold is None else model["pair_models"][fold]
+    return _bilinear(za, zb, entry["M"]) + entry["b"]
 
 
 @st.cache_data(show_spinner="Learning pair chemistry from the pair data...")
 def fit_pair_synergy(_pairs, _zfeat, _row_of, base_cols, target_label, cache_key):
-    """Learn which skill combinations make a pair beat (or miss) what its
-    two players' individual quality predicts."""
+    """Learn which skill shapes make a pair beat (or miss) what its two
+    players' individual quality predicts."""
     rating, base, sign = PAIR_TARGETS[target_label]
     out = {"ok": False, "target": target_label}
 
@@ -3192,6 +3366,9 @@ def fit_pair_synergy(_pairs, _zfeat, _row_of, base_cols, target_label, cache_key
 
     pool["y"] = sign * (pool[rating] - pool[base])
     pool["e"] = _pair_residuals(pool)
+
+    # Real pair history is kept for display only. Scoring never uses it
+    # unless the user asks.
     out["evidence"] = pool[["Season", "PlayerA", "PlayerB", "Minutes", "e"]].copy()
 
     pool["rowA"] = (pool["PlayerA"] + "|" + pool["Season"]).map(_row_of)
@@ -3211,20 +3388,24 @@ def fit_pair_synergy(_pairs, _zfeat, _row_of, base_cols, target_label, cache_key
     za = _zfeat.loc[pool["rowA"].astype(int).to_numpy(), list(base_cols)].to_numpy(float)
     zb = _zfeat.loc[pool["rowB"].astype(int).to_numpy(), list(base_cols)].to_numpy(float)
 
-    out.update(_fit_pair_core(pool, za, zb))
+    out.update(_fit_pair_geometry(pool, za, zb))
     out["feature_names"] = _pair_feature_names(list(base_cols))
+    out["base_cols"] = list(base_cols)
+    out["axes"] = _geometry_axes(out["full"]["M"], list(base_cols))
     out["ok"] = True
     return out
 
 
 @st.cache_data(show_spinner=False)
-def pair_layer_backtest(_model, _zfeat, _cores, _builder, base_cols, target_label, cache_key):
-    """Does adding pair chemistry help predict results on unseen seasons?
+def pair_layer_backtest(_model, _zfeat, _cores, _builder, _ids, base_cols, target_label, cache_key):
+    """Does adding pair chemistry help predict results?
 
     For each historical team (or real lineup), sum the expected chemistry of
-    its five main players' 10 pairs (from a model that never saw that
-    season), then see how well that explains what the sum-of-parts model got
-    wrong. Rows are weighted by minutes when the data has weights.
+    its five main players' 10 pairs, then see how well that explains what the
+    sum-of-parts model got wrong. Every pair is scored by a model that never
+    saw that pair's own results, in any season, so a duo can't earn credit for
+    having already proved itself. Rows are weighted by minutes when the data
+    has weights.
     """
     data = _builder["data"]
     oof_add = np.asarray(_builder["additive"]["oof"], float)
@@ -3235,7 +3416,7 @@ def pair_layer_backtest(_model, _zfeat, _cores, _builder, base_cols, target_labe
     )
     rows_i, rows_j = np.triu_indices(5, k=1)
 
-    out = {"n": 0, "helps": False, "lam": 0.0}
+    out = {"n": 0, "helps": False, "lam": 0.0, "held_out": "each pair's own history"}
     core_rows = [_cores.get(key) for key in zip(data["Season"], data["Tm"])]
     valid = np.array([r is not None and len(r) == 5 for r in core_rows])
     if valid.sum() < 100:
@@ -3245,18 +3426,20 @@ def pair_layer_backtest(_model, _zfeat, _cores, _builder, base_cols, target_labe
     rows = np.array([core_rows[i] for i in valid_index])
     positions = _zfeat.index.get_indexer(rows.ravel()).reshape(rows.shape)
     z = _zfeat[list(base_cols)].to_numpy(float)[positions]   # rows x 5 x skills
+    ids = np.asarray(_ids)[positions]                        # rows x 5 player ids
 
-    seasons_valid = data["Season"].astype(str).to_numpy()[valid_index]
-    fold_ids = np.array([_model["fold_of"].get(s, -1) for s in seasons_valid])
-
+    total = np.zeros(len(valid_index))
+    for i, j in zip(rows_i, rows_j):
+        folds = np.array([
+            _fold_of_key(_pair_key(a, b)) for a, b in zip(ids[:, i], ids[:, j])
+        ])
+        for fold in np.unique(folds):
+            chosen = folds == fold
+            total[chosen] += _pair_predict(
+                _model, z[chosen, i, :], z[chosen, j, :], int(fold)
+            )
     summed = np.full(len(data), np.nan)
-    for fold_id in np.unique(fold_ids):
-        chosen = fold_ids == fold_id
-        fold = None if fold_id == -1 else int(fold_id)
-        part = np.zeros(int(chosen.sum()))
-        for i, j in zip(rows_i, rows_j):
-            part += _pair_predict(_model, z[chosen, i, :], z[chosen, j, :], fold)
-        summed[valid_index[chosen]] = part
+    summed[valid_index] = total
 
     ok = ~np.isnan(summed)
     out["n"] = int(ok.sum())
@@ -3290,9 +3473,9 @@ def pair_layer_backtest(_model, _zfeat, _cores, _builder, base_cols, target_labe
         adjustment[test] = lam_f * s[test]
 
     y_bar = float((w * y).sum() / w.sum())
-    total = float((w * (y - y_bar) ** 2).sum())
-    r2_without = 1 - float((w * (y - base) ** 2).sum()) / total
-    r2_with = 1 - float((w * (y - base - adjustment) ** 2).sum()) / total
+    total_ss = float((w * (y - y_bar) ** 2).sum())
+    r2_without = 1 - float((w * (y - base) ** 2).sum()) / total_ss
+    r2_with = 1 - float((w * (y - base - adjustment) ** 2).sum()) / total_ss
 
     lam = float(np.clip(lam_raw, 0, 1.5))
     out.update({
@@ -3317,22 +3500,34 @@ def run_pair_layer(pairs, zfeat, data, pools, results, target_label, base_cols):
     )
     if not model.get("ok"):
         return model
+    ids = data["player_id"].astype(str).reindex(zfeat.index).to_numpy()
     backtest = pair_layer_backtest(
-        model, zfeat, pools.get("cores", {}), results,
+        model, zfeat, pools.get("cores", {}), results, ids,
         tuple(base_cols), target_label, key,
     )
     return {**model, "backtest": backtest}
 
 
-def lineup_pair_synergy(data, zfeat, model, rows, base_cols):
-    """Expected, observed and blended chemistry for the 10 pairs in a lineup."""
+def lineup_pair_synergy(data, zfeat, model, rows, base_cols, use_history=False):
+    """Skill-based chemistry for the 10 pairs in a lineup.
+
+    Each pair is scored by the model that never saw that pair's own results.
+    Real history is shown for context. It only changes the number used when
+    use_history is on, because letting a duo's past results raise its score
+    is exactly the hindsight this layer is meant to avoid.
+    """
     ids = [str(data.loc[r, "player_id"]) for r in rows]
     seasons = [str(data.loc[r, "Season"]) for r in rows]
     labels = [f"{data.loc[r, 'player_name']} {data.loc[r, 'Season']}" for r in rows]
 
     z = zfeat.loc[rows, list(base_cols)].to_numpy(float)
     ii, jj = np.triu_indices(5, k=1)
-    expected = _pair_predict(model, z[ii], z[jj])
+    expected = np.array([
+        float(_pair_predict(
+            model, z[a:a + 1], z[b:b + 1], _fold_of_key(_pair_key(ids[a], ids[b]))
+        )[0])
+        for a, b in zip(ii, jj)
+    ])
 
     evidence = model["evidence"]
     relevant = evidence[
@@ -3357,24 +3552,23 @@ def lineup_pair_synergy(data, zfeat, model, rows, base_cols):
             if minutes > 0:
                 observed = float((used["e"] * used["Minutes"]).sum() / minutes)
 
-        weight = minutes / (minutes + PAIR_EVIDENCE_MINUTES) if pd.notna(observed) else 0.0
-        blended = (
-            weight * observed + (1 - weight) * expected[n]
-            if weight > 0 else float(expected[n])
-        )
+        value = float(expected[n])
+        if use_history and pd.notna(observed):
+            weight = minutes / (minutes + PAIR_EVIDENCE_MINUTES)
+            value = weight * observed + (1 - weight) * value
         records.append({
             "Pair": f"{labels[a]} + {labels[b]}",
             "Skills predict": float(expected[n]),
             "Seen together": kind,
             "Shared minutes": minutes,
-            "Observed": observed,
-            "Blended": float(blended),
+            "Real history": observed,
+            "Used": float(value),
         })
     return pd.DataFrame(records)
 
 
 def _pair_skill_combos(pairs, data):
-    """Pair Lab tab: which skill combinations tend to overperform."""
+    """Pair Lab tab: the skill geometry behind pair chemistry."""
     zfeat, _, _ = builder_tables(data)
     if zfeat.empty or "Season" not in data.columns:
         st.info("This needs the player stats (minutes, possessions and shot data).")
@@ -3393,28 +3587,76 @@ def _pair_skill_combos(pairs, data):
         st.warning(model.get("reason", "Couldn't fit the pair model."))
         return
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Pair-seasons used", f"{model['n']:,}",
-              help=f"At least {PAIR_MODEL_MIN_MINUTES} shared minutes, "
-                   f"{model['season_type'].lower()}, matched to player stats.")
-    c2.metric("Skills explain (unseen seasons)", f"{model['r2']:.1%}",
-              help="Share of pair-specific deviation (after removing each "
-                   "player's own effect) that skill combinations predict on "
-                   "seasons the model never saw.")
-    c3.metric("...among 500+ minute pairs",
-              "—" if pd.isna(model["r2_solid"]) else f"{model['r2_solid']:.1%}")
+    validation = model["validation"]
 
+    def percent(value):
+        return "—" if pd.isna(value) else f"{value:.1%}"
+
+    st.markdown("#### Do skills alone predict chemistry?")
+    c1, c2, c3 = st.columns(3)
+    c1.metric(
+        "Same players, new seasons", percent(validation["season"]),
+        help="The model has seen these players and pairs in other seasons. "
+             "This is the easiest test and the least convincing.",
+    )
+    c2.metric(
+        "A pair it never saw", percent(validation["pair"]),
+        help="The model never saw this pair's results in any season, though "
+             "it saw each player with other teammates.",
+    )
+    c3.metric(
+        "Players it never saw", percent(validation["player"]),
+        help="Neither player appeared in training at all. This is the real "
+             "test that the model learned skill geometry, not people.",
+    )
     st.caption(
-        "Each pair's net rating is first adjusted for how good each player is "
-        "on his own. What's left is how the pair did beyond its parts, and "
-        "the table shows which skill combinations predict it. Pair ratings "
-        "are noisy, so even real chemistry shows up as a small percentage."
+        f"Learned from {model['n']:,} pair-seasons and {model['n_players']:,} "
+        f"players, using {'all axes' if model['rank'] is None else str(model['rank']) + ' skill axes'}. "
+        "If the three scores are close, the model is learning geometry. If "
+        "the first is much higher than the last, part of it is memorizing "
+        "specific players."
     )
 
-    coef = model["full"][1]
-    table = pd.DataFrame({"Pattern": model["feature_names"], "Weight": coef})
+    if pd.notna(validation["player"]) and validation["player"] <= 0.001:
+        st.info(
+            "Skills alone don't predict chemistry for players the model "
+            "hasn't seen. At this level of detail, pair results look mostly "
+            "like the sum of the two players, so the axes and patterns below "
+            "shouldn't be trusted."
+        )
+
+    st.markdown("#### The axes of skill fit")
+    axes = model.get("axes", [])[:6]
+    if axes:
+        rows = []
+        for number, axis in enumerate(axes, start=1):
+            high = ", ".join(axis["high"]) or "—"
+            low = ", ".join(axis["low"]) or "—"
+            rows.append({
+                "Axis": f"Axis {number}",
+                "Rewards": "Opposites (complements)" if axis["kind"] == "complement"
+                           else "Alike (both on the same side)",
+                "Strength": axis["strength"],
+                "High end": high,
+                "Low end": low,
+            })
+        st.dataframe(
+            pd.DataFrame(rows).style.format({"Strength": "{:.3f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            "Each axis is a blend of skills. Along a 'complements' axis, a "
+            "pair does best when one player is at the high end and the other "
+            "at the low end, and worst when both sit on the same side "
+            "(redundancy). Along an 'alike' axis it's the reverse."
+        )
+
+    st.markdown("#### Individual skill pairings")
+    weights = _weights_from_matrix(model["M_raw"])
+    table = pd.DataFrame({"Pattern": model["feature_names"], "Weight": weights})
     if model["halves"] is not None:
-        half1, half2 = model["halves"]
+        half1, half2 = (_weights_from_matrix(m) for m in model["halves"])
         table["First half"], table["Second half"] = half1, half2
         floor = 0.02
         table["Holds in both halves"] = (
@@ -3432,11 +3674,7 @@ def _pair_skill_combos(pairs, data):
     shown = shown.reindex(shown["Weight"].abs().sort_values(ascending=False).index).head(25)
 
     if shown.empty:
-        st.info(
-            "No skill pattern was stable across both halves of the seasons. "
-            "That's a real finding: at this level of detail, pair results "
-            "look mostly like the sum of the two players."
-        )
+        st.info("No single pairing was stable across both halves of the seasons.")
         return
 
     st.dataframe(
@@ -3448,7 +3686,7 @@ def _pair_skill_combos(pairs, data):
     )
     st.caption(
         "Weight is the change in a pair's net rating (per 100 possessions) "
-        "for a one-standard-deviation move in that pattern. 'One has X, the "
+        "for a one-standard-deviation move in that pairing. 'One has X, the "
         "other has Y' means either player may hold either skill. These are "
         "patterns in past data, not guarantees."
     )
