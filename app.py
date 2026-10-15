@@ -4643,18 +4643,23 @@ st.write("")
 # NAVIGATION
 # --------------------------------------------------
 
-players_tab, compare_tab, lab_tab, builder_tab = st.tabs([
-    "🏀 Player Explorer",
-    "⚖️ Compare",
-    "🧪 Data Lab",
-    "🧬 Team Builder",
-])
+selected_page = st.radio(
+    "Navigate",
+    [
+        "🏀 Player Explorer",
+        "⚖️ Compare",
+        "🧪 Data Lab",
+        "🧬 Team Builder",
+    ],
+    horizontal=True,
+    key="main_page",
+)
 
 # --------------------------------------------------
 # PLAYER EXPLORER
 # --------------------------------------------------
 
-with players_tab:
+if selected_page == "🏀 Player Explorer":
     st.markdown(
         '<div class="section-label">01 / Player Explorer</div>',
         unsafe_allow_html=True
@@ -4877,7 +4882,7 @@ with players_tab:
 # PLAYER COMPARISON
 # --------------------------------------------------
 
-with compare_tab:
+elif selected_page == "⚖️ Compare":
     st.markdown(
         '<div class="section-label">02 / Player Comparison</div>',
         unsafe_allow_html=True
@@ -4963,7 +4968,7 @@ with compare_tab:
 # DATA LAB (houses the Player Lab and Team Lab)
 # --------------------------------------------------
 
-with lab_tab:
+elif selected_page == "🧪 Data Lab":
     st.markdown(
         '<div class="section-label">03 / Data Lab</div>',
         unsafe_allow_html=True
@@ -5406,7 +5411,7 @@ with lab_tab:
 # TEAM BUILDER
 # --------------------------------------------------
 
-with builder_tab:
+elif selected_page == "🧬 Team Builder":
     render_team_builder(df, player_labels, player_options)
 
 st.markdown(
@@ -5416,6 +5421,9 @@ st.markdown(
     '</div>',
     unsafe_allow_html=True
 )
+
+
+
 
 
 
