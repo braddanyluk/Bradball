@@ -1350,20 +1350,31 @@ def render_team_builder(df, player_labels, player_options):
 
     base_cols = list(zfeat.columns)
 
-    # ---- Real five-man lineups, if the files are present ----
+    # ---- Real five-man lineups, gated by a button to save RAM ----
     lineup_data, lineup_problem, lineup_info = None, None, None
-    if any(path.exists() for path in LINEUP_FILES):
-        try:
-            loaded, loaded_report = load_lineups()
-            if loaded is None:
-                lineup_problem = (
-                    "; ".join(loaded_report["problems"])
-                    + " (Data Lab, then Lineup Lab, shows what's in the files.)"
-                )
-            else:
-                lineup_data = loaded
-        except Exception as error:
-            lineup_problem = f"The lineup files couldn't be used: {error}"
+    
+    if "load_lineups_clicked" not in st.session_state:
+        st.session_state.load_lineups_clicked = False
+
+    if not st.session_state.load_lineups_clicked:
+        if any(path.exists() for path in LINEUP_FILES):
+            st.info("🛑 Team Builder data is paused on startup to protect server memory.")
+            if st.button("🚀 Load Lineup Models & Data (Activate Team Builder)"):
+                st.session_state.load_lineups_clicked = True
+                st.rerun()
+    else:
+        if any(path.exists() for path in LINEUP_FILES):
+            try:
+                loaded, loaded_report = load_lineups()
+                if loaded is None:
+                    lineup_problem = (
+                        "; ".join(loaded_report["problems"])
+                        + " (Data Lab, then Lineup Lab, shows what's in the files.)"
+                    )
+                else:
+                    lineup_data = loaded
+            except Exception as error:
+                lineup_problem = f"The lineup files couldn't be used: {error}"
 
     use_lineups = False
     if lineup_data is not None:
