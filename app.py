@@ -918,7 +918,7 @@ def _player_feature_z(data):
     return z.clip(-3.5, 3.5).fillna(0), raw, mean, std
 
 
-@st.cache_data(show_spinner="Building lineup profiles...", max_entries=1)
+@st.cache_resource(show_spinner="Building lineup profiles...")
 def builder_tables(data):
     """Player z-scores, a 'core five' profile per team-season, and the
     historical limits on shared resources."""
@@ -1026,25 +1026,25 @@ def apply_pool_limits(data, zfeat, pools, rows, feature_cols):
 
 
 def _design(features, interactions):
-    """Feature table, optionally with pairwise products and squares.
-
-    Products are the 'stacking' terms: they let the effect of one skill
-    depend on how much of another skill the group also has.
-    """
+    """Build additive features, optionally with pairwise products and squares."""
+    columns = list(features.columns)
     if not interactions:
         return features.copy()
 
-    columns = list(features.columns)
-    extra = {}
+    base = features.to_numpy(dtype=np.float32, copy=False)
+    n_rows, n_features = base.shape
+    n_products = n_features * (n_features + 1) // 2
+    values = np.empty((n_rows, n_features + n_products), dtype=np.float32)
+    values[:, :n_features] = base
+    names = list(columns)
+    index = n_features
     for i, a in enumerate(columns):
-        for b in columns[i:]:
-            name = f"{a} (squared)" if a == b else f"{a} × {b}"
-            extra[name] = features[a] * features[b]
-
-    return pd.concat(
-        [features, pd.DataFrame(extra, index=features.index)], axis=1
-    )
-
+        for j in range(i, n_features):
+            b = columns[j]
+            values[:, index] = base[:, i] * base[:, j]
+            names.append(f"{a} (squared)" if i == j else f"{a} × {b}")
+            index += 1
+    return pd.DataFrame(values, columns=names, index=features.index)
 
 def _ridge_fit(X, y, alpha, w=None):
     if w is None:
@@ -1174,7 +1174,7 @@ def _fit_variant_blocked(X, y, w, season_index, season_fold, k, alphas):
     return alpha, sse, oof, model, boot
 
 
-@st.cache_data(show_spinner="Fitting the model across seasons...", max_entries=2)
+@st.cache_resource(show_spinner="Fitting the model across seasons...")
 def fit_builder_models(profiles, feature_cols, target_col, weight_col=None, carry_cols=()):
     """Fit additive and interaction models, scored on unseen seasons.
 
@@ -1217,7 +1217,7 @@ def fit_builder_models(profiles, feature_cols, target_col, weight_col=None, carr
     results = {}
     for name, interactions in (("additive", False), ("interact", True)):
         design = _design(data[feature_cols], interactions)
-        X = design.to_numpy(float)
+        X = design.to_numpy(dtype=np.float32, copy=False)
 
         if blocked:
             alpha, sse, oof, model, boot = _fit_variant_blocked(
@@ -1264,6 +1264,7 @@ def fit_builder_models(profiles, feature_cols, target_col, weight_col=None, carr
             "model": model,
             "columns": list(design.columns),
         }
+        del design, X
 
     # What do real historical groups look like? Used by the guardrails.
     F = data[feature_cols].to_numpy(float)
@@ -1499,19 +1500,28 @@ def render_team_builder(df, player_labels, player_options):
 
     additive, interact = results["additive"], results["interact"]
 
-    # ---- Pair chemistry layer (learned from the pair data) ----
+    # ---- Optional pair chemistry layer (extra memory and computation) ----
     pair_layer, pair_problem = None, None
+    enable_pair_layer = False
     if PAIR_FILE.exists():
+        enable_pair_layer = st.checkbox(
+            "Load pair chemistry (uses extra memory)",
+            value=False,
+            key="builder_enable_pair_layer",
+            help="The core lineup model works without this optional layer. "
+                 "Turn it on to include learned pair effects.",
+        )
+    if PAIR_FILE.exists() and enable_pair_layer:
         try:
             pair_data, _ = load_pairs()
             if pair_data is None:
-                pair_problem = "The pair file couldn't be read."
+                pair_problem = "The pair file could not be read."
             else:
                 pair_layer = run_pair_layer(
                     pair_data, zfeat, df, pools, results, target_label, base_cols
                 )
         except Exception as error:
-            pair_problem = f"Pair data couldn't be used: {error}"
+            pair_problem = f"Pair data could not be used: {error}"
 
     # ---- Model report card ----
     st.markdown("#### How good is the model?")
@@ -3932,7 +3942,7 @@ def _extract_lineup_ids(d):
     return ids.apply(_clean_id), f"the '{column}' column"
 
 
-@st.cache_data(show_spinner="Loading five-man lineup data...", max_entries=1)
+@st.cache_resource(show_spinner="Loading five-man lineup data...")
 def load_lineups():
     """Combine and clean the lineup files. Returns (data, report).
 
@@ -4409,7 +4419,7 @@ def render_lineup_lab(df):
 # LINEUP MODEL INPUTS (used by the Team Builder)
 # --------------------------------------------------
 
-@st.cache_data(show_spinner="Building lineup profiles from real lineups...", max_entries=1)
+@st.cache_resource(show_spinner="Building lineup profiles from real lineups...")
 def build_lineup_training(_data, _lineups, _zfeat, _pools, base_cols, cache_key):
     """Skill profile for every real lineup, plus limits on shared resources.
 
@@ -4443,16 +4453,24 @@ def build_lineup_training(_data, _lineups, _zfeat, _pools, base_cols, cache_key)
 
     Lm = L[matched]
     R = labels[matched].astype(int).to_numpy()
-    zvals = _zfeat[base_cols].to_numpy(float)
+    zvals = _zfeat[base_cols].to_numpy(dtype=np.float32)
     zpos = _zfeat.index.get_indexer(R.ravel()).reshape(R.shape)
-    Z3 = zvals[zpos]                                   # lineups x 5 players x skills
 
-    prof = pd.DataFrame(Z3.mean(axis=1), columns=base_cols)
+    # Average the five player profiles incrementally. Building the full
+    # lineups x 5 x features tensor can use hundreds of MB for large files.
+    prof_values = np.zeros((len(R), len(base_cols)), dtype=np.float32)
+    for player_slot in range(5):
+        prof_values += zvals[zpos[:, player_slot]]
+    prof_values /= 5
+    prof = pd.DataFrame(prof_values, columns=base_cols)
     feature_index = {c: i for i, c in enumerate(base_cols)}
     for label, feature, how in ROLE_FEATURES:
         if feature in feature_index:
-            column = Z3[:, :, feature_index[feature]]
-            prof[label] = column.max(axis=1) if how == "max" else column.min(axis=1)
+            column = zvals[zpos[:, 0], feature_index[feature]]
+            for player_slot in range(1, 5):
+                player_values = zvals[zpos[:, player_slot], feature_index[feature]]
+                column = np.maximum(column, player_values) if how == "max" else np.minimum(column, player_values)
+            prof[label] = column
 
     prof["Season"] = Lm["Season"].to_numpy()
     prof["Tm"] = (Lm["TeamId"] + ":" + Lm["LineupKey"]).to_numpy()
@@ -5421,6 +5439,13 @@ st.markdown(
     '</div>',
     unsafe_allow_html=True
 )
+
+
+
+
+
+
+
 
 
 
