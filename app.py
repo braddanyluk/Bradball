@@ -1285,7 +1285,7 @@ def _fit_variant_blocked(X, y, w, season_index, season_fold, k, alphas):
 @st.cache_resource(show_spinner="Fitting the model across seasons...")
 def fit_builder_models(_profiles, feature_cols, target_col, weight_col=None,
                        carry_cols=(), interaction_cols=(), cache_key=()):
-    """Fit additive and interaction models, scored on unseen seasons.
+    """Fit additive and interaction models, scored on held-out groups.
 
     Seasons are split into folds, and each fold is predicted by a model
     that never saw those seasons. That out-of-sample score is the honest
@@ -1422,6 +1422,7 @@ def fit_builder_models(_profiles, feature_cols, target_col, weight_col=None,
                 inner_folds = np.array([inner_fold_of[g] for g in train_groups])
                 train_rows = np.flatnonzero(future_train)
                 inner_weights = w_all[future_train]
+                inner_model_weights = subset(weights, future_train)
                 best_future = None
                 for candidate_alpha in alphas:
                     inner_sse = 0.0
@@ -1432,7 +1433,9 @@ def fit_builder_models(_profiles, feature_cols, target_col, weight_col=None,
                             continue
                         inner_model = _ridge_fit(
                             X[train_rows[fit_local]], y[train_rows[fit_local]],
-                            candidate_alpha, subset(weights, future_train)[fit_local],
+                            candidate_alpha,
+                            (inner_model_weights[fit_local]
+                             if inner_model_weights is not None else None),
                         )
                         inner_pred = _ridge_predict(
                             inner_model, X[train_rows[val_local]]
@@ -1594,6 +1597,7 @@ def render_team_builder(df, player_labels, player_options):
 
     # ---- Real five-man lineups, if the files are present ----
     lineup_data, lineup_problem, lineup_info = None, None, None
+    lineup_load_report = {}
     if any(path.exists() for path in LINEUP_FILES):
         try:
             loaded, loaded_report = load_lineups()
@@ -1604,6 +1608,7 @@ def render_team_builder(df, player_labels, player_options):
                 )
             else:
                 lineup_data = loaded
+                lineup_load_report = loaded_report
         except Exception as error:
             lineup_problem = f"The lineup files couldn't be used: {error}"
 
@@ -1667,6 +1672,11 @@ def render_team_builder(df, player_labels, player_options):
     if use_lineups:
         training, _, pools, lineup_info = build_lineup_training(
             df, lineup_data, zfeat, pools, tuple(base_cols), _lineup_cache_key()
+        )
+        lineup_info["source_rows_raw"] = lineup_load_report.get("rows_raw")
+        lineup_info["source_rows_clean"] = lineup_load_report.get("rows_clean")
+        lineup_info["source_duplicates_removed"] = lineup_load_report.get(
+            "duplicates_removed", 0
         )
         if training is None:
             st.warning(lineup_info.get("reason", "Couldn't build profiles from the lineups."))
@@ -1766,47 +1776,106 @@ def render_team_builder(df, player_labels, player_options):
     # ---- Model report card ----
     st.markdown("#### How good is the model?")
 
-    m1, m2, m3 = st.columns(3)
-    score_unit = "unseen lineups" if use_lineups else "held-out seasons"
-    m1.metric(f"Sum of parts R² ({score_unit})", f"{additive['r2']:.1%}")
-    m2.metric(f"Player-pair R² ({score_unit})", f"{interact['r2']:.1%}")
-    m3.metric(
-        "RMSE: sum / pair model",
-        f"±{additive['rmse']:.1f} / ±{interact['rmse']:.1f} pts/100",
-        help="Root mean squared prediction error on held-out data. "
-             "These are outcome errors, not uncertainty bands for one lineup.",
-    )
-
-    if use_lineups and additive.get("future") and interact.get("future"):
-        future_add, future_pair = additive["future"], interact["future"]
-        f1, f2, f3 = st.columns(3)
-        f1.metric(
-            "Future-season R²: sum / pair",
-            f"{future_add['r2']:.1%} / {future_pair['r2']:.1%}",
-            help="Train on earlier seasons, then predict the latest seasons. "
-                 "Repeated five-player lineups are removed from training.",
-        )
-        f2.metric(
-            "Future RMSE: sum / pair",
-            f"±{future_add['rmse']:.1f} / ±{future_pair['rmse']:.1f} pts/100",
-        )
-        f3.metric(
-            "Future test seasons",
-            ", ".join(future_pair["seasons"]),
-        )
-
     gain = interact["r2"] - additive["r2"]
+    if use_lineups:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Skill-interaction model", f"{interact['r2']:.1%} R²")
+        m2.metric("Typical miss on held-out lineups", f"about ±{interact['rmse']:.1f} pts/100")
+        m3.metric(
+            "Sum-of-parts comparison",
+            f"{additive['r2']:.1%} R²",
+            delta=f"{gain:+.1%} with interactions",
+        )
+        st.caption(
+            "R² is how much lineup-to-lineup variation the model explains; "
+            "it is not the percent of predictions that are correct. The miss "
+            "is an average error size, not a guaranteed range for one lineup. "
+            "Short-minute ratings are pulled toward league average before fitting."
+        )
+        if additive.get("future") and interact.get("future"):
+            future_add, future_pair = additive["future"], interact["future"]
+            seasons = future_pair["seasons"]
+            season_span = (
+                f"{seasons[0]} through {seasons[-1]}"
+                if len(seasons) > 1 else (seasons[0] if seasons else "not available")
+            )
+            with st.expander("Does it carry over to newer seasons?"):
+                st.write(
+                    f"Trained on earlier seasons and checked on {season_span}. "
+                    "Any exact five-player lineup repeated across the split was "
+                    "removed from training."
+                )
+                st.write(
+                    f"With skill interactions: {future_pair['r2']:.1%} R², "
+                    f"about ±{future_pair['rmse']:.1f} pts/100 typical miss. "
+                    f"Sum-of-parts baseline: {future_add['r2']:.1%} R² "
+                    f"(about ±{future_add['rmse']:.1f} pts/100)."
+                )
+        st.caption(
+            f"Training used {usable:,} lineup records with matched player stats "
+            f"and at least {LINEUP_MODEL_MIN_MINUTES} minutes, out of "
+            f"{lineup_info['lineups']:,} cleaned records "
+            f"({lineup_info['matched']:,} matched to player seasons). "
+            f"Those training records total {lineup_info['training_minutes']:,.0f} minutes. "
+            "Each record summarizes a five-player group, not one possession "
+            "or play."
+        )
+        with st.expander("How much lineup data made it into training?"):
+            raw_rows = lineup_info.get("source_rows_raw")
+            raw_count = (
+                f"{raw_rows:,} rows across the source files"
+                if raw_rows is not None else "source row count unavailable"
+            )
+            cleaned_rows = lineup_info.get("source_rows_clean") or lineup_info["lineups"]
+            matched_rows = lineup_info["matched"]
+            fit_rows = int(usable)
+            st.write(f"**Read from files:** {raw_count}.")
+            st.write(
+                f"**After parsing and removing duplicate/invalid rows:** "
+                f"{cleaned_rows:,}."
+            )
+            st.write(
+                f"**Matched to all five players' season stats:** "
+                f"{matched_rows:,} of {lineup_info['lineups']:,} cleaned records "
+                f"({matched_rows / max(lineup_info['lineups'], 1):.1%})."
+            )
+            st.write(
+                f"**Passed the {LINEUP_MODEL_MIN_MINUTES}-minute cutoff:** "
+                f"{lineup_info.get('training_lineups', 0):,} records; "
+                f"{lineup_info.get('training_combinations', 0):,} distinct "
+                f"five-player combinations. The target rating was available "
+                f"for {fit_rows:,} of them."
+            )
+            st.caption(
+                "So the headline training count is not the number of raw file "
+                "rows or possessions. This breakdown shows whether most rows "
+                "were removed by parsing, player-season matching, or the "
+                "minimum-minutes rule."
+            )
+    else:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Sum of parts R² (held-out seasons)", f"{additive['r2']:.1%}")
+        m2.metric("Player-pair R² (held-out seasons)", f"{interact['r2']:.1%}")
+        m3.metric(
+            "RMSE: sum / pair model",
+            f"±{additive['rmse']:.1f} / ±{interact['rmse']:.1f} pts/100",
+            help="Root mean squared prediction error on held-out data. "
+                 "These are outcome errors, not uncertainty bands for one lineup.",
+        )
+
     if gain > 0.01:
+        generalization_group = "unseen lineups" if use_lineups else "held-out seasons"
         st.success(
             f"The skill-interaction model improved the main held-out score "
             f"by {gain:.1%} points. This is evidence of added signal for "
-            "unseen lineups; check the future-season score below too."
+            f"{generalization_group}; check the future-season details below too."
         )
         default_model = 1
     else:
         st.info(
             "The skill-interaction model didn't clearly improve predictions "
-            "on unseen lineups. It remains the selected estimate so the app "
+            f"on {('unseen lineups' if use_lineups else 'held-out seasons')}. "
+            "It remains the selected estimate so the app "
             "can show what the learned player-pair skill fit predicts, but "
             "the backtest says that signal is not yet reliable."
         )
@@ -1815,15 +1884,6 @@ def render_team_builder(df, player_labels, player_options):
         default_model = 1
 
     if use_lineups:
-        st.caption(
-            f"Learned from {lineup_info['training_lineups']:,} real five-man "
-            f"lineups ({lineup_info['training_minutes']:,.0f} minutes). The "
-            "main score holds out entire five-player combinations. The future "
-            "check trains only on earlier seasons and removes repeated lineups. "
-            "Low-minute observed ratings are shrunk toward league average; all "
-            "scores are weighted by minutes. R² is variation explained, not "
-            "the percentage of lineups predicted correctly."
-        )
         with st.expander("How did the older team-based method do on real lineups?"):
             check = legacy_scale_check(
                 df, zfeat, profiles, merged, feature_cols, target_label
@@ -1927,8 +1987,8 @@ def render_team_builder(df, player_labels, player_options):
     st.caption(
         "The player-pair model learns whether combinations of skills across "
         "different players raise or lower a lineup's result. It is selected "
-        "by default because that is the purpose of this tool; the unseen-"
-        "season score above shows how well it generalizes."
+        "by default because that is the purpose of this tool; the score above "
+        "shows how it generalizes to held-out data."
     )
 
     chosen_key = "additive" if model_choice == "Sum of parts" else "interact"
@@ -4817,8 +4877,10 @@ def build_lineup_training(_data, _lineups, _zfeat, _pools, base_cols, cache_key)
     report = {
         "lineups": len(L),
         "matched": int(matched.sum()),
+        "unmatched": int((~matched).sum()),
         "match_rate": float(matched.mean()) if len(L) else 0.0,
         "minutes_match_rate": float(L.loc[matched, "Minutes"].sum() / total_minutes) if total_minutes else 0.0,
+        "distinct_combinations": int(L["LineupKey"].nunique()),
     }
     if report["minutes_match_rate"] < 0.5 or matched.sum() < 500:
         report["reason"] = (
@@ -4829,6 +4891,9 @@ def build_lineup_training(_data, _lineups, _zfeat, _pools, base_cols, cache_key)
         return None, {}, {}, report
 
     Lm = L[matched]
+    report["matched_below_minute_cutoff"] = int(
+        (Lm["Minutes"] < LINEUP_MODEL_MIN_MINUTES).sum()
+    )
     R = labels[matched].astype(int).to_numpy()
     zvals = _zfeat[base_cols].to_numpy(dtype=np.float32)
     zpos = _zfeat.index.get_indexer(R.ravel()).reshape(R.shape)
@@ -4893,6 +4958,7 @@ def build_lineup_training(_data, _lineups, _zfeat, _pools, base_cols, cache_key)
         for s, t, rows in zip(training["Season"], training["Tm"], R[keep])
     }
     report["training_lineups"] = len(training)
+    report["training_combinations"] = int(training["LineupKey"].nunique())
     report["training_minutes"] = float(training["Minutes"].sum())
     return training, cores, {**pools, "cores": cores}, report
 
