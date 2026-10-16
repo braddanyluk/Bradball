@@ -1537,40 +1537,23 @@ def render_team_builder(df, player_labels, player_options):
     st.header("Build a lineup")
 
     st.write(
-        "Pick five players and the tool estimates how that group would "
-        "perform with all five on the floor together. Nothing here is a "
-        "hand-written rule: the model learns what matters from history, "
-        "and then tells you how well it can do that."
+        "Choose five players to estimate how they might perform together. "
+        "The estimate is learned from real player and lineup data."
     )
 
-    with st.expander("How this works, and what it can't see"):
+    with st.expander("How the estimate works"):
         st.markdown(
-            "- Each player-season is compared with the league in **its own "
-            "season**, so players from different eras can share a lineup.\n"
-            "- Each real five-man lineup supplies its own result and the "
-            "skills of the five players who produced it.\n"
-            "- The skill-interaction model includes products between skills "
-            "belonging to different players, across all ten pairs. This lets "
-            "it learn skill fit from lineups without memorizing player names.\n"
-            "- A separate additive model is kept as a comparison. Both are "
-            "scored only on **seasons they haven't seen**; with lineup data, "
-            "lineups with more minutes count for more.\n"
-            "- **Shared resources:** a team only has so many shots, "
-            "assists and rebounds. If five players together would use more "
-            "than any real top five ever has, everyone's share is scaled "
-            "down to fit.\n"
-            "- **Roles, not just averages:** the model also sees the best "
-            "passer, best rim protector, best shooter volume and the "
-            "'spacing floor' on the floor. That lets it learn the cost of "
-            "lacking a capability from real teams that lacked it.\n"
-            "- **Unusual lineups:** by default the model extrapolates and "
-            "shows a range that widens when a group is unlike history. "
-            "'Strict' mode instead caps results at the best and worst real "
-            "teams.\n"
-            "- **Blind spots:** defense is only visible through steals, "
-            "blocks and rebounds. Coaching, injuries, bench depth and "
-            "opponent quality aren't in the model. On/off data will help "
-            "most with defense and real pair-level synergy."
+            "- Player stats are compared with others from the same season, "
+            "so players from different eras can be combined.\n"
+            "- The model learns from real five-player lineups and checks its "
+            "estimates on lineups it did not learn from.\n"
+            "- It looks at each player's skills and how those skills may fit "
+            "together.\n"
+            "- Lineups with more playing time provide stronger evidence.\n"
+            "- Estimates are less certain for combinations unlike the ones "
+            "in the data.\n"
+            "- The data cannot capture everything, such as coaching, "
+            "matchups, injuries, or every defensive role."
         )
 
     zfeat, profiles, pools = builder_tables(df)
@@ -1582,10 +1565,10 @@ def render_team_builder(df, player_labels, player_options):
         return
 
     base_cols = list(zfeat.columns)
-    with st.expander("Which player skills can the model see?"):
+    with st.expander("What player stats are included?"):
         st.write(
-            "Available signals are used automatically; fields absent from the "
-            "player file are skipped. Current signals: "
+            "The app uses the available stats below. If a stat is missing "
+            "from the data, it is skipped. Current stats: "
             + (", ".join(base_cols) if base_cols else "none found")
             + "."
         )
@@ -1662,7 +1645,7 @@ def render_team_builder(df, player_labels, player_options):
         return
 
     target_label = st.radio(
-        "What should the model predict?",
+            "What should the estimate focus on?",
         list(targets.keys()),
         horizontal=True,
         key="builder_target",
@@ -1774,22 +1757,22 @@ def render_team_builder(df, player_labels, player_options):
             pair_problem = f"Pair data could not be used: {error}"
 
     # ---- Model report card ----
-    st.markdown("#### How good is the model?")
+    st.markdown("#### How reliable are its estimates?")
 
     gain = interact["r2"] - additive["r2"]
     if use_lineups:
         m1, m2, m3 = st.columns(3)
-        m1.metric("Skill-interaction model", f"{interact['r2']:.1%} R²")
-        m2.metric("Typical miss on held-out lineups", f"about ±{interact['rmse']:.1f} pts/100")
+        m1.metric("Skill-fit model", f"{interact['r2']:.1%} of differences explained")
+        m2.metric("Typical error on new lineups", f"about ±{interact['rmse']:.1f} pts/100")
         m3.metric(
-            "Sum-of-parts comparison",
-            f"{additive['r2']:.1%} R²",
-            delta=f"{gain:+.1%} with interactions",
+            "Skills added together",
+            f"{additive['r2']:.1%} of differences explained",
+            delta=f"{gain:+.1%} with skill fit",
         )
         st.caption(
-            "R² is how much lineup-to-lineup variation the model explains; "
-            "it is not the percent of predictions that are correct. The miss "
-            "is an average error size, not a guaranteed range for one lineup. "
+            "“Differences explained” compares the model with guessing the "
+            "average lineup. It is not the percent of predictions that are "
+            "correct. The typical error is an average, not a guaranteed range. "
             "Short-minute ratings are pulled toward league average before fitting."
         )
         if additive.get("future") and interact.get("future"):
@@ -1854,10 +1837,10 @@ def render_team_builder(df, player_labels, player_options):
             )
     else:
         m1, m2, m3 = st.columns(3)
-        m1.metric("Sum of parts R² (held-out seasons)", f"{additive['r2']:.1%}")
-        m2.metric("Player-pair R² (held-out seasons)", f"{interact['r2']:.1%}")
+        m1.metric("Skills added together", f"{additive['r2']:.1%} explained")
+        m2.metric("With player skill fit", f"{interact['r2']:.1%} explained")
         m3.metric(
-            "RMSE: sum / pair model",
+            "Typical error: skills / skill fit",
             f"±{additive['rmse']:.1f} / ±{interact['rmse']:.1f} pts/100",
             help="Root mean squared prediction error on held-out data. "
                  "These are outcome errors, not uncertainty bands for one lineup.",
@@ -1978,8 +1961,8 @@ def render_team_builder(df, player_labels, player_options):
         st.caption(pair_problem)
 
     model_choice = st.radio(
-        "Model used for predictions",
-        ["Sum of parts", "With player-pair skill fit"],
+        "How should player skills be combined?",
+        ["Add skills together", "Include how skills fit together"],
         index=default_model,
         horizontal=True,
         key="builder_model_pairfit_v2",
@@ -1991,7 +1974,9 @@ def render_team_builder(df, player_labels, player_options):
         "shows how it generalizes to held-out data."
     )
 
-    chosen_key = "additive" if model_choice == "Sum of parts" else "interact"
+    chosen_key = (
+        "additive" if model_choice == "Add skills together" else "interact"
+    )
     chosen = results[chosen_key]
 
     if use_pair_layer and chosen_key == "interact":
@@ -2081,14 +2066,12 @@ def render_team_builder(df, player_labels, player_options):
         )
     with mode_col2:
         limit_pools = st.checkbox(
-            "Apply historical volume caps",
+            "Limit unusually high combined stats",
             value=False,
             key="builder_pools",
-            help="An optional heuristic: if the five players' summed per-100 rates "
-                 "exceed the 99th percentile seen in historical lineups, "
-                 "the app scales every player's rate in that category down "
-                 "by the same proportion. It does not measure how a player's "
-                 "rate changes beside a particular teammate.",
+            help="An optional safeguard that lowers a combined stat if it is "
+                 "far above what appeared in real lineups. It is not a "
+                 "teammate-specific skill interaction.",
         )
     strict = guardrail_mode.startswith("Strict")
 
