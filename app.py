@@ -862,6 +862,67 @@ ROLE_FEATURES = [
 ]
 
 BUILDER_BOOTSTRAPS = 150
+BUILDER_PAIR_AXES = 8
+
+
+def _fit_builder_pair_axes(z, feature_cols, n_axes=BUILDER_PAIR_AXES):
+    """Compress player skills into a small, stable space for pair modeling."""
+    values = z[feature_cols].to_numpy(dtype=np.float32, copy=False)
+    if len(values) < 2 or not feature_cols:
+        return np.zeros((len(feature_cols), 0), dtype=np.float32), []
+    covariance = (values.T @ values) / max(len(values), 1)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    order = np.argsort(eigenvalues)[::-1][:min(n_axes, len(feature_cols))]
+    axes = eigenvectors[:, order].astype(np.float32)
+    # Keep signs deterministic so labels and cached outputs don't flip.
+    for column in range(axes.shape[1]):
+        pivot = int(np.argmax(np.abs(axes[:, column])))
+        if axes[pivot, column] < 0:
+            axes[:, column] *= -1
+    labels = []
+    for column in range(axes.shape[1]):
+        loadings = axes[:, column]
+        top = np.argsort(np.abs(loadings))[::-1][:3]
+        labels.append(
+            f"Skill axis {column + 1} (" + ", ".join(
+                ("+" if loadings[i] >= 0 else "−") + str(feature_cols[i])
+                for i in top
+            ) + ")"
+        )
+    return axes, labels
+
+
+def _builder_pair_interactions(projected):
+    """Sum symmetric skill-fit products over the ten player pairs.
+
+    `projected` has shape (lineups, 5, skill_axes). Unlike products of a
+    lineup average, these features only multiply skills across two different
+    players, so they directly represent pair fit.
+    """
+    projected = np.asarray(projected, dtype=np.float32)
+    n_rows, n_players, n_axes = projected.shape
+    rows, cols = np.triu_indices(n_axes)
+    output = np.zeros((n_rows, len(rows)), dtype=np.float32)
+    pair_count = 0
+    for i in range(n_players):
+        for j in range(i + 1, n_players):
+            left, right = projected[:, i, :], projected[:, j, :]
+            output += left[:, rows] * right[:, cols]
+            off_diagonal = rows != cols
+            output[:, off_diagonal] += (
+                left[:, cols[off_diagonal]] * right[:, rows[off_diagonal]]
+            )
+            pair_count += 1
+    if pair_count:
+        output /= pair_count
+    return output
+
+
+def _builder_pair_columns(axis_labels):
+    return [
+        f"Pair fit: {axis_labels[a]} × {axis_labels[b]}"
+        for a, b in zip(*np.triu_indices(len(axis_labels)))
+    ]
 
 
 def role_values(z_rows):
@@ -976,6 +1037,19 @@ def builder_tables(data):
         if len(group) == 5
     }
 
+    # Learn compact skill axes once, then preserve player-to-player products
+    # for each historical core. These features are trained from the actual
+    # five-man outcomes in Team Builder.
+    pair_axes, pair_axis_labels = _fit_builder_pair_axes(z, list(z.columns))
+    pair_cols = _builder_pair_columns(pair_axis_labels)
+    if pair_cols:
+        projected = z[list(z.columns)].to_numpy(dtype=np.float32) @ pair_axes
+        profile_keys = list(zip(profile["Season"], profile["Tm"]))
+        core_rows = np.asarray([cores[key] for key in profile_keys], dtype=int)
+        profile_pair_values = _builder_pair_interactions(projected[core_rows])
+        for i, column in enumerate(pair_cols):
+            profile[column] = profile_pair_values[:, i]
+
     pools = {
         "cores": cores,
         "raw": raw,
@@ -983,6 +1057,9 @@ def builder_tables(data):
         "std": std_table,
         "defs": pool_defs,
         "caps": caps,
+        "interaction_axes": pair_axes,
+        "interaction_axis_labels": pair_axis_labels,
+        "interaction_cols": pair_cols,
     }
     return z, profile, pools
 
@@ -1175,7 +1252,8 @@ def _fit_variant_blocked(X, y, w, season_index, season_fold, k, alphas):
 
 
 @st.cache_resource(show_spinner="Fitting the model across seasons...")
-def fit_builder_models(profiles, feature_cols, target_col, weight_col=None, carry_cols=()):
+def fit_builder_models(profiles, feature_cols, target_col, weight_col=None,
+                       carry_cols=(), interaction_cols=()):
     """Fit additive and interaction models, scored on unseen seasons.
 
     Seasons are split into folds, and each fold is predicted by a model
@@ -1187,6 +1265,13 @@ def fit_builder_models(profiles, feature_cols, target_col, weight_col=None, carr
     """
     data = profiles.dropna(subset=[target_col]).reset_index(drop=True)
     y = data[target_col].to_numpy(float)
+    interaction_support = None
+    if interaction_cols:
+        pair_values = data[list(interaction_cols)].to_numpy(dtype=float)
+        interaction_support = {
+            "lo": np.percentile(pair_values, 1, axis=0),
+            "hi": np.percentile(pair_values, 99, axis=0),
+        }
 
     weights = None
     if weight_col is not None:
@@ -1217,6 +1302,11 @@ def fit_builder_models(profiles, feature_cols, target_col, weight_col=None, carr
     results = {}
     for name, interactions in (("additive", False), ("interact", True)):
         design = _design(data[feature_cols], interactions)
+        if interactions and interaction_cols:
+            design = pd.concat(
+                [design, data[list(interaction_cols)].reset_index(drop=True)],
+                axis=1,
+            )
         X = design.to_numpy(dtype=np.float32, copy=False)
 
         if blocked:
@@ -1306,6 +1396,8 @@ def fit_builder_models(profiles, feature_cols, target_col, weight_col=None, carr
     results["data"] = data[keep].assign(actual=y)
     if weight_col is not None:
         results["data"]["weight"] = data[weight_col].to_numpy(float)
+    results["interaction_cols"] = list(interaction_cols)
+    results["interaction_support"] = interaction_support
     return results
 
 
@@ -1328,15 +1420,14 @@ def render_team_builder(df, player_labels, player_options):
         st.markdown(
             "- Each player-season is compared with the league in **its own "
             "season**, so players from different eras can share a lineup.\n"
-            "- Each real five-man lineup (or, in the older method, each "
-            "team's five highest-minute players) is summarized by the "
-            "average profile of its five players.\n"
-            "- A model learns how those profiles relate to results, and is "
-            "scored only on **seasons it hasn't seen**. With lineup data, "
+            "- Each real five-man lineup supplies its own result and the "
+            "skills of the five players who produced it.\n"
+            "- The skill-interaction model includes products between skills "
+            "belonging to different players, across all ten pairs. This lets "
+            "it learn skill fit from lineups without memorizing player names.\n"
+            "- A separate additive model is kept as a comparison. Both are "
+            "scored only on **seasons they haven't seen**; with lineup data, "
             "lineups with more minutes count for more.\n"
-            "- A second version also gets *interaction* terms (products of "
-            "skills). If it predicts unseen seasons better, that's evidence "
-            "that skills stack beyond simple addition.\n"
             "- **Shared resources:** a team only has so many shots, "
             "assists and rebounds. If five players together would use more "
             "than any real top five ever has, everyone's share is scaled "
@@ -1459,12 +1550,14 @@ def render_team_builder(df, player_labels, player_options):
             )
             return
         results = fit_builder_models(
-            merged, feature_cols, "_target", "weight", ("Team", "Minutes")
+            merged, feature_cols, "_target", "weight", ("Team", "Minutes"),
+            interaction_cols=tuple(pools.get("interaction_cols", ())),
         )
     else:
         feature_cols = [
             c for c in profiles.columns
             if c not in ("Season", "Tm", "Core five")
+            and c not in pools.get("interaction_cols", ())
         ]
         merged = profiles.merge(
             teams[["Season", "Tm", "Era", source_col]],
@@ -1496,7 +1589,10 @@ def render_team_builder(df, player_labels, player_options):
             )
             return
 
-        results = fit_builder_models(merged, feature_cols, "_target")
+        results = fit_builder_models(
+            merged, feature_cols, "_target",
+            interaction_cols=tuple(pools.get("interaction_cols", ())),
+        )
 
     additive, interact = results["additive"], results["interact"]
 
@@ -1528,7 +1624,7 @@ def render_team_builder(df, player_labels, player_options):
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Sum of parts (unseen seasons)", f"{additive['r2']:.1%}")
-    m2.metric("With interactions (unseen seasons)", f"{interact['r2']:.1%}")
+    m2.metric("Player-pair skill fit (unseen seasons)", f"{interact['r2']:.1%}")
     m3.metric(
         "Typical error",
         f"±{min(additive['rmse'], interact['rmse']):.1f} pts/100",
@@ -1537,19 +1633,21 @@ def render_team_builder(df, player_labels, player_options):
     gain = interact["r2"] - additive["r2"]
     if gain > 0.01:
         st.success(
-            f"Adding interaction terms improved predictions on unseen "
-            f"seasons by {gain:.1%} points, which is some evidence that "
-            "skills stack beyond simple addition."
+            f"The skill-interaction model improved predictions on unseen "
+            f"seasons by {gain:.1%} points, evidence that skill fit adds "
+            "information beyond the sum of player profiles."
         )
         default_model = 1
     else:
         st.info(
-            "Interaction terms didn't clearly improve predictions on "
-            "unseen seasons. At this level of detail, a lineup looks "
-            "roughly like the sum of its parts. Finer-grained on/off data "
-            "is a better place to look for pair-level synergy."
+            "The skill-interaction model didn't clearly improve predictions "
+            "on unseen seasons. It remains the selected estimate so the app "
+            "can show what the learned player-pair skill fit predicts, but "
+            "the backtest says that signal is not yet reliable."
         )
-        default_model = 0
+        # This app's purpose is to estimate skill fit, so keep that model
+        # selected by default and report its validation score openly.
+        default_model = 1
 
     if use_lineups:
         st.caption(
@@ -1655,27 +1753,26 @@ def render_team_builder(df, player_labels, player_options):
 
     model_choice = st.radio(
         "Model used for predictions",
-        ["Sum of parts", "With interactions"],
+        ["Sum of parts", "With player-pair skill fit"],
         index=default_model,
         horizontal=True,
-        key="builder_model",
+        key="builder_model_pairfit_v2",
     )
     st.caption(
-        "Interaction models are more flexible, which also makes them more "
-        "likely to run wild on unusual lineups. The guardrails below "
-        "limit that, but 'Sum of parts' is the safer choice for exotic "
-        "groups."
+        "The player-pair model learns whether combinations of skills across "
+        "different players raise or lower a lineup's result. It is selected "
+        "by default because that is the purpose of this tool; the unseen-"
+        "season score above shows how well it generalizes."
     )
 
     chosen_key = "additive" if model_choice == "Sum of parts" else "interact"
     chosen = results[chosen_key]
 
     if use_pair_layer and chosen_key == "interact":
-        chosen_key, chosen = "additive", results["additive"]
         st.caption(
-            "Pair chemistry sits on top of the sum-of-parts model, so "
-            "interaction terms are off while it's on. Otherwise the same "
-            "effect would be counted twice."
+            "The player-pair skill model remains active. The optional pair "
+            "history layer is added separately and is evaluated after the "
+            "skill-interaction model."
         )
 
     # ---- Calibration: is the model too cautious? ----
@@ -1839,6 +1936,20 @@ def render_team_builder(df, player_labels, player_options):
         )
         support = results["support"]
         raw_vec = lineup.to_numpy(float)
+        interaction_cols = results.get("interaction_cols", [])
+        interaction_axes = pools.get("interaction_axes")
+        pair_interaction_vec = np.zeros(len(interaction_cols), dtype=np.float32)
+        if (interaction_cols and interaction_axes is not None
+                and interaction_axes.shape[1]):
+            projected_players = (
+                lineup_z[base_cols].to_numpy(dtype=np.float32) @ interaction_axes
+            )[None, :, :]
+            pair_interaction_vec = _builder_pair_interactions(projected_players)[0]
+            if strict and results.get("interaction_support") is not None:
+                pair_support = results["interaction_support"]
+                pair_interaction_vec = np.clip(
+                    pair_interaction_vec, pair_support["lo"], pair_support["hi"]
+                )
 
         # How far is this group from anything that ever actually played?
         centered = raw_vec - support["mu"]
@@ -1850,13 +1961,10 @@ def render_team_builder(df, player_labels, player_options):
         )
         beyond_history = lineup_d2 > float(support["d2"].max())
 
-        # Products of extreme values explode, so for the most unusual
-        # lineups fall back to the sum-of-parts model.
+        # Keep the skill-interaction model active for unusual lineups too.
+        # Strict mode clips its inputs; otherwise uncertainty reflects the
+        # extrapolation rather than silently removing the interaction signal.
         active_key, active = chosen_key, chosen
-        interactions_disabled = False
-        if active_key == "interact" and unusual_pct >= 99:
-            active_key, active = "additive", results["additive"]
-            interactions_disabled = True
 
         outside = []
         for i, feature in enumerate(feature_cols):
@@ -1867,11 +1975,18 @@ def render_team_builder(df, player_labels, player_options):
                 outside.append((feature, raw_vec[i], support["lo"][i],
                                 support["lo"][i] - raw_vec[i]))
 
-        def model_output(vector):
+        def model_output(vector, pair_values=None):
             row = _design(
                 pd.DataFrame([vector], columns=feature_cols),
                 active_key == "interact",
-            )[active["columns"]]
+            )
+            if active_key == "interact" and interaction_cols:
+                pair_row = pd.DataFrame(
+                    [pair_interaction_vec if pair_values is None else pair_values],
+                    columns=interaction_cols,
+                )
+                row = pd.concat([row.reset_index(drop=True), pair_row], axis=1)
+            row = row[active["columns"]]
             values = row.to_numpy(float)
             return values, float(_ridge_predict(active["model"], values)[0])
 
@@ -1893,9 +2008,7 @@ def render_team_builder(df, player_labels, player_options):
 
         if strict:
             # Keep inputs inside history, shrink if far outside, and cap.
-            X, prediction = model_output(
-                np.clip(raw_vec, support["lo"], support["hi"])
-            )
+            X, prediction = model_output(np.clip(raw_vec, support["lo"], support["hi"]))
             if beyond_history:
                 trust = float(np.sqrt(support["d2"].max() / lineup_d2))
             prediction *= trust * calib_scale
@@ -1967,12 +2080,11 @@ def render_team_builder(df, player_labels, player_options):
                  "historical cores.",
         )
 
-        if interactions_disabled:
+        if active_key == "interact" and unusual_pct >= 99:
             st.caption(
-                "Interaction terms were switched off for this lineup. "
-                "They multiply skills together, and for a group this "
-                "extreme those products explode, so the sum-of-parts "
-                "model was used instead."
+                "The skill-interaction model remains active for this unusual "
+                "group. Treat the prediction cautiously; strict mode clips "
+                "the interaction inputs to the training range."
             )
 
         if use_lineups:
@@ -2173,11 +2285,18 @@ def render_team_builder(df, player_labels, player_options):
                 )
 
         # ---- How this number was built ----
-        def model_for(key, vector):
+        def model_for(key, vector, pair_values=None):
             info = results[key]
             row = _design(
                 pd.DataFrame([vector], columns=feature_cols), key == "interact"
-            )[info["columns"]]
+            )
+            if key == "interact" and interaction_cols:
+                pair_row = pd.DataFrame(
+                    [pair_interaction_vec if pair_values is None else pair_values],
+                    columns=interaction_cols,
+                )
+                row = pd.concat([row.reset_index(drop=True), pair_row], axis=1)
+            row = row[info["columns"]]
             return float(_ridge_predict(info["model"], row.to_numpy(float))[0])
 
         unscaled_z = zfeat.loc[selected_rows, base_cols]
@@ -2185,15 +2304,21 @@ def render_team_builder(df, player_labels, player_options):
             pd.concat([unscaled_z.mean(axis=0), role_values(unscaled_z)])
             .reindex(feature_cols).fillna(0).to_numpy(float)
         )
+        pair_unscaled = pair_interaction_vec
+        if interaction_cols and interaction_axes is not None and interaction_axes.shape[1]:
+            pair_unscaled = _builder_pair_interactions(
+                (unscaled_z.to_numpy(dtype=np.float32) @ interaction_axes)[None, :, :]
+            )[0]
         skills_only = model_for("additive", vec_unscaled)
-        active_unscaled = model_for(active_key, vec_unscaled)
-        active_limited = model_for(active_key, raw_vec)
+        active_unscaled = model_for(active_key, vec_unscaled, pair_unscaled)
+        active_limited = model_for(active_key, raw_vec, pair_interaction_vec)
 
         stage_rows = [
             ("Individual skills (sum of parts)", skills_only,
              "What the five can do, added up, vs. an average team."),
-            ("Skill interactions", active_unscaled - skills_only,
-             "Credit or penalty for how the skills combine."),
+            ("Skill interactions, including player-pair fit",
+             active_unscaled - skills_only,
+             "Credit or penalty learned from how skills combine across the five players."),
             ("Not enough to go around", active_limited - active_unscaled,
              "Shots, assists and rebounds trimmed where the five want more "
              "than any real top five has used."),
@@ -2238,7 +2363,15 @@ def render_team_builder(df, player_labels, player_options):
                 .reindex(feature_cols).fillna(0).to_numpy(float)
             )
             player_effects.append(
-                (model_for(active_key, raw_vec) - model_for(active_key, vec))
+                (model_for(active_key, raw_vec, pair_interaction_vec)
+                 - model_for(
+                     active_key,
+                     vec,
+                     _builder_pair_interactions(
+                         (swapped[base_cols].to_numpy(dtype=np.float32) @ interaction_axes)[None, :, :]
+                     )[0] if interaction_cols and interaction_axes is not None
+                     and interaction_axes.shape[1] else pair_interaction_vec,
+                 ))
                 * calib_scale * basis_scale
             )
 
@@ -3425,13 +3558,14 @@ def pair_layer_backtest(_model, _zfeat, _cores, _builder, _ids, base_cols, targe
 
     For each historical team (or real lineup), sum the expected chemistry of
     its five main players' 10 pairs, then see how well that explains what the
-    sum-of-parts model got wrong. Every pair is scored by a model that never
+    skill-interaction model got wrong. Every pair is scored by a model that never
     saw that pair's own results, in any season, so a duo can't earn credit for
     having already proved itself. Rows are weighted by minutes when the data
     has weights.
     """
     data = _builder["data"]
-    oof_add = np.asarray(_builder["additive"]["oof"], float)
+    baseline_model = _builder.get("interact", _builder["additive"])
+    oof_add = np.asarray(baseline_model["oof"], float)
     actual = data["actual"].to_numpy(float)
     weights = (
         data["weight"].to_numpy(float) if "weight" in data.columns
@@ -4503,6 +4637,14 @@ def build_lineup_training(_data, _lineups, _zfeat, _pools, base_cols, cache_key)
         prof_values += zvals[zpos[:, player_slot]]
     prof_values /= 5
     prof = pd.DataFrame(prof_values, columns=base_cols)
+    interaction_axes = _pools.get("interaction_axes")
+    interaction_cols = _pools.get("interaction_cols", [])
+    if interaction_axes is not None and interaction_axes.shape[1] and interaction_cols:
+        player_axis_scores = zvals @ interaction_axes
+        lineup_axis_scores = player_axis_scores[zpos]
+        pair_values = _builder_pair_interactions(lineup_axis_scores)
+        for i, column in enumerate(interaction_cols):
+            prof[column] = pair_values[:, i]
     feature_index = {c: i for i, c in enumerate(base_cols)}
     for label, feature, how in ROLE_FEATURES:
         if feature in feature_index:
