@@ -812,6 +812,17 @@ BUILDER_FEATURES = [
      lambda d: _ratio(_num(d, "AtRimFGM"), _num(d, "AtRimFGA"), 50)),
     ("Mid-range attempts /100", ["ShortMidRangeFGA", "LongMidRangeFGA"],
      lambda d: _p100(d, "ShortMidRangeFGA") + _p100(d, "LongMidRangeFGA")),
+    # These location and creation signals are optional: older player files
+    # simply omit them, while newer tracking exports can provide them.
+    ("Corner 3 attempts /100", ["Corner3FGA"], _per100_feature("Corner3FGA")),
+    ("Arc 3 attempts /100", ["Arc3FGA"], _per100_feature("Arc3FGA")),
+    ("Unassisted scoring /100", ["PtsUnassisted2s", "PtsUnassisted3s"],
+     lambda d: _p100(d, "PtsUnassisted2s") + _p100(d, "PtsUnassisted3s")),
+    ("Shot quality", ["ShotQualityAvg"], lambda d: _num(d, "ShotQualityAvg")),
+    ("Corner 3 accuracy", ["Corner3FGM", "Corner3FGA"],
+     lambda d: _ratio(_num(d, "Corner3FGM"), _num(d, "Corner3FGA"), 20)),
+    ("Arc 3 accuracy", ["Arc3FGM", "Arc3FGA"],
+     lambda d: _ratio(_num(d, "Arc3FGM"), _num(d, "Arc3FGA"), 20)),
     ("eFG%", ["FG2M", "FG3M", "FG2A", "FG3A"],
      lambda d: _ratio(
          _num(d, "FG2M") + 1.5 * _num(d, "FG3M"),
@@ -1301,13 +1312,27 @@ def fit_builder_models(_profiles, feature_cols, target_col, weight_col=None,
 
     seasons = data["Season"].astype(str).to_numpy()
     unique_seasons = sorted(set(seasons))
-    k = min(5, len(unique_seasons))
-    fold_of = {s: i % k for i, s in enumerate(unique_seasons)}
-    folds = np.array([fold_of[s] for s in seasons])
+    # When five-man lineups are available, keep every appearance of the same
+    # five players in one fold. This tests whether skill profiles generalize
+    # to combinations the model did not train on, rather than letting the
+    # same lineup reappear in another season's training rows.
+    if "LineupKey" in data.columns:
+        groups = data["LineupKey"].fillna("").astype(str).to_numpy()
+        unique_groups = sorted(set(groups))
+    else:
+        groups = seasons
+        unique_groups = unique_seasons
+    k = min(5, len(unique_groups))
+    fold_of = {group: i % k for i, group in enumerate(unique_groups)}
+    folds = np.array([fold_of[group] for group in groups])
 
     season_index = np.array([unique_seasons.index(s) for s in seasons]) if len(unique_seasons) < 200 else None
-    season_fold = np.array([fold_of[s] for s in unique_seasons])
-    blocked = weights is not None and len(unique_seasons) >= 8
+    # This vector is used only by the season-blocked fast path, where groups
+    # are seasons. Lineup-key folds use the ordinary grouped fit below.
+    season_fold = np.array([i % min(5, len(unique_seasons))
+                            for i, _ in enumerate(unique_seasons)])
+    blocked = (weights is not None and len(unique_seasons) >= 8
+               and "LineupKey" not in data.columns)
 
     y_bar = float((w_all * y).sum() / w_all.sum())
     total_ss = float((w_all * (y - y_bar) ** 2).sum())
@@ -1346,21 +1371,101 @@ def fit_builder_models(_profiles, feature_cols, target_col, weight_col=None,
             sse, alpha, oof = best
             model = _ridge_fit(X, y, alpha, weights)
 
-            # Refit on resampled history. When a lineup is unlike anything in
-            # the data, these refits disagree with each other, and that
-            # disagreement is the model's honest measure of what it doesn't know.
+            # Resample whole seasons when possible because lineup rows from
+            # one season share opponents and environment. Small datasets fall
+            # back to row resampling.
             rng = np.random.default_rng(0)
-            fits = [
-                _ridge_fit(X[idx], y[idx], alpha, subset(weights, idx))
-                for idx in (rng.integers(0, len(y), len(y))
-                            for _ in range(BUILDER_BOOTSTRAPS))
-            ]
+            if weights is not None and len(unique_seasons) >= 8 and season_index is not None:
+                stats = _season_stats(X, y, weights, season_index, len(unique_seasons))
+                fits = [
+                    _ridge_from_stats(
+                        stats,
+                        rng.multinomial(
+                            len(unique_seasons),
+                            np.full(len(unique_seasons), 1.0 / len(unique_seasons)),
+                        ).astype(float),
+                        alpha,
+                    )
+                    for _ in range(BUILDER_BOOTSTRAPS)
+                ]
+            else:
+                fits = [
+                    _ridge_fit(X[idx], y[idx], alpha, subset(weights, idx))
+                    for idx in (rng.integers(0, len(y), len(y))
+                                for _ in range(BUILDER_BOOTSTRAPS))
+                ]
             boot = {
                 "mu": np.array([f[0] for f in fits]),
                 "sd": np.array([f[1] for f in fits]),
                 "ym": np.array([f[2] for f in fits]),
                 "coef": np.array([f[3] for f in fits]),
             }
+
+        # Separate forward-in-time check: train only on earlier seasons,
+        # purge exact five-player groups that recur in the future block, and
+        # choose regularization using the earlier data alone.
+        future_eval = None
+        n_future = max(1, int(np.ceil(len(unique_seasons) * 0.2)))
+        if len(unique_seasons) >= 4:
+            future_seasons = set(unique_seasons[-n_future:])
+            future_test = np.isin(seasons, list(future_seasons))
+            future_train = ~future_test
+            if "LineupKey" in data.columns and future_test.any():
+                held_groups = set(groups[future_test])
+                future_train &= ~np.isin(groups, list(held_groups))
+            train_seasons = set(seasons[future_train])
+            if future_test.any() and len(train_seasons) >= 2 and future_train.sum() >= 100:
+                train_groups = groups[future_train]
+                inner_groups = sorted(set(train_groups))
+                inner_k = min(3, len(inner_groups))
+                inner_fold_of = {g: i % inner_k for i, g in enumerate(inner_groups)}
+                inner_folds = np.array([inner_fold_of[g] for g in train_groups])
+                train_rows = np.flatnonzero(future_train)
+                inner_weights = w_all[future_train]
+                best_future = None
+                for candidate_alpha in alphas:
+                    inner_sse = 0.0
+                    for inner_fold in range(inner_k):
+                        fit_local = inner_folds != inner_fold
+                        val_local = inner_folds == inner_fold
+                        if not fit_local.any() or not val_local.any():
+                            continue
+                        inner_model = _ridge_fit(
+                            X[train_rows[fit_local]], y[train_rows[fit_local]],
+                            candidate_alpha, subset(weights, future_train)[fit_local],
+                        )
+                        inner_pred = _ridge_predict(
+                            inner_model, X[train_rows[val_local]]
+                        )
+                        inner_sse += float(
+                            (inner_weights[val_local]
+                             * (y[train_rows[val_local]] - inner_pred) ** 2).sum()
+                        )
+                    if best_future is None or inner_sse < best_future[0]:
+                        best_future = (inner_sse, candidate_alpha)
+                future_alpha = best_future[1] if best_future else alpha
+                future_model = _ridge_fit(
+                    X[future_train], y[future_train], future_alpha,
+                    subset(weights, future_train),
+                )
+                future_pred = _ridge_predict(future_model, X[future_test])
+                future_weights = w_all[future_test]
+                future_mean = float(
+                    (w_all[future_train] * y[future_train]).sum()
+                    / w_all[future_train].sum()
+                )
+                future_ss = float(
+                    (future_weights * (y[future_test] - future_mean) ** 2).sum()
+                )
+                future_sse = float(
+                    (future_weights * (y[future_test] - future_pred) ** 2).sum()
+                )
+                future_eval = {
+                    "r2": 1 - future_sse / future_ss if future_ss > 0 else np.nan,
+                    "rmse": float(np.sqrt(future_sse / future_weights.sum())),
+                    "seasons": sorted(future_seasons),
+                    "n": int(future_test.sum()),
+                }
 
         results[name] = {
             "boot": boot,
@@ -1371,6 +1476,7 @@ def fit_builder_models(_profiles, feature_cols, target_col, weight_col=None,
             "fitted": _ridge_predict(model, X),
             "model": model,
             "columns": list(design.columns),
+            "future": future_eval,
         }
         del design, X
 
@@ -1473,6 +1579,18 @@ def render_team_builder(df, player_labels, player_options):
         return
 
     base_cols = list(zfeat.columns)
+    with st.expander("Which player skills can the model see?"):
+        st.write(
+            "Available signals are used automatically; fields absent from the "
+            "player file are skipped. Current signals: "
+            + (", ".join(base_cols) if base_cols else "none found")
+            + "."
+        )
+        st.caption(
+            "The feature list includes optional shot-location, shot-quality, "
+            "and unassisted-scoring measures when those columns exist in the "
+            "player data."
+        )
 
     # ---- Real five-man lineups, if the files are present ----
     lineup_data, lineup_problem, lineup_info = None, None, None
@@ -1555,7 +1673,13 @@ def render_team_builder(df, player_labels, player_options):
             return
 
         merged = training.copy()
-        merged["_target"] = sign * merged[source_col]
+        # A short lineup sample is less stable than a long one. Shrink its
+        # observed deviation toward league average before fitting; minute
+        # weights still let the larger samples carry more information.
+        reliability = merged["Minutes"] / (
+            merged["Minutes"] + LINEUP_TARGET_PRIOR_MINUTES
+        )
+        merged["_target"] = sign * merged[source_col] * reliability
         feature_cols = base_cols + [
             label for label, _, _ in ROLE_FEATURES if label in merged.columns
         ]
@@ -1643,27 +1767,46 @@ def render_team_builder(df, player_labels, player_options):
     st.markdown("#### How good is the model?")
 
     m1, m2, m3 = st.columns(3)
-    m1.metric("Sum of parts R² (held-out seasons)", f"{additive['r2']:.1%}")
-    m2.metric("Player-pair skill fit R² (held-out seasons)", f"{interact['r2']:.1%}")
+    score_unit = "unseen lineups" if use_lineups else "held-out seasons"
+    m1.metric(f"Sum of parts R² ({score_unit})", f"{additive['r2']:.1%}")
+    m2.metric(f"Player-pair R² ({score_unit})", f"{interact['r2']:.1%}")
     m3.metric(
         "RMSE: sum / pair model",
         f"±{additive['rmse']:.1f} / ±{interact['rmse']:.1f} pts/100",
-        help="Root mean squared prediction error on held-out seasons. "
+        help="Root mean squared prediction error on held-out data. "
              "These are outcome errors, not uncertainty bands for one lineup.",
     )
+
+    if use_lineups and additive.get("future") and interact.get("future"):
+        future_add, future_pair = additive["future"], interact["future"]
+        f1, f2, f3 = st.columns(3)
+        f1.metric(
+            "Future-season R²: sum / pair",
+            f"{future_add['r2']:.1%} / {future_pair['r2']:.1%}",
+            help="Train on earlier seasons, then predict the latest seasons. "
+                 "Repeated five-player lineups are removed from training.",
+        )
+        f2.metric(
+            "Future RMSE: sum / pair",
+            f"±{future_add['rmse']:.1f} / ±{future_pair['rmse']:.1f} pts/100",
+        )
+        f3.metric(
+            "Future test seasons",
+            ", ".join(future_pair["seasons"]),
+        )
 
     gain = interact["r2"] - additive["r2"]
     if gain > 0.01:
         st.success(
-            f"The skill-interaction model improved predictions on unseen "
-            f"seasons by {gain:.1%} points, evidence that skill fit adds "
-            "information beyond the sum of player profiles."
+            f"The skill-interaction model improved the main held-out score "
+            f"by {gain:.1%} points. This is evidence of added signal for "
+            "unseen lineups; check the future-season score below too."
         )
         default_model = 1
     else:
         st.info(
             "The skill-interaction model didn't clearly improve predictions "
-            "on unseen seasons. It remains the selected estimate so the app "
+            "on unseen lineups. It remains the selected estimate so the app "
             "can show what the learned player-pair skill fit predicts, but "
             "the backtest says that signal is not yet reliable."
         )
@@ -1674,11 +1817,12 @@ def render_team_builder(df, player_labels, player_options):
     if use_lineups:
         st.caption(
             f"Learned from {lineup_info['training_lineups']:,} real five-man "
-            f"lineups ({lineup_info['training_minutes']:,.0f} minutes), "
-            "weighted by minutes. R² is the share of variation in held-out "
-            "lineup ratings explained compared with predicting the weighted "
-            "average. A score around 17% means modest predictive signal, not "
-            "17% of lineups predicted correctly. Five-man ratings are noisy."
+            f"lineups ({lineup_info['training_minutes']:,.0f} minutes). The "
+            "main score holds out entire five-player combinations. The future "
+            "check trains only on earlier seasons and removes repeated lineups. "
+            "Low-minute observed ratings are shrunk toward league average; all "
+            "scores are weighted by minutes. R² is variation explained, not "
+            "the percentage of lineups predicted correctly."
         )
         with st.expander("How did the older team-based method do on real lineups?"):
             check = legacy_scale_check(
@@ -1878,9 +2022,9 @@ def render_team_builder(df, player_labels, player_options):
     with mode_col2:
         limit_pools = st.checkbox(
             "Apply historical volume caps",
-            value=True,
+            value=False,
             key="builder_pools",
-            help="A heuristic: if the five players' summed per-100 rates "
+            help="An optional heuristic: if the five players' summed per-100 rates "
                  "exceed the 99th percentile seen in historical lineups, "
                  "the app scales every player's rate in that category down "
                  "by the same proportion. It does not measure how a player's "
@@ -3976,7 +4120,8 @@ LINEUP_TARGET_COLUMNS = {
 
 LINEUP_MODEL_MIN_MINUTES = 40     # lineups below this are too noisy to train on
 LINEUP_WEIGHT_CAP = 800           # no single lineup counts for more than this
-LINEUP_SHRINK_MINUTES = 800       # lineup ratings are very noisy: shrink hard
+LINEUP_SHRINK_MINUTES = 800       # Lineup Lab's historical display shrinkage
+LINEUP_TARGET_PRIOR_MINUTES = 200 # Team Builder target reliability prior
 LINEUP_CAP_MIN_MINUTES = 200      # lineups used to set "most ever" resource limits
 
 LINEUP_SAMPLE_LABELS = [
@@ -4118,7 +4263,37 @@ def load_lineups():
         if not path.exists():
             report["files"].append((path.name, None))
             continue
-        part = pd.read_csv(path, compression="gzip", low_memory=False)
+        # Read the header first, then load only columns consumed by Team
+        # Builder and Lineup Lab. These exports can contain hundreds of
+        # unused tracking columns, which are expensive to inflate in memory.
+        header = pd.read_csv(path, compression="gzip", nrows=0).columns
+        canonical_needed = {
+            "Season", "SeasonType", "Team", "TeamId", "Minutes",
+            *LINEUP_RATES, *LINEUP_PCTS,
+            "Points", "OpponentPoints", "OffPoss", "DefPoss",
+        }
+        accepted = set()
+        for canonical in canonical_needed:
+            accepted.add(canonical.lower().replace(" ", ""))
+            for alias in _LINEUP_ALIASES.get(canonical, []):
+                accepted.add(alias.lower().replace(" ", ""))
+        id_columns = []
+        for column in header:
+            norm = str(column).lower().replace(" ", "").replace("_", "")
+            if (re.fullmatch(r"(?:player[1-5]id|player[1-5]|p[1-5]id|p[1-5]|playerid[1-5])", norm)
+                    or norm in {hint.replace("_", "") for hint in _LINEUP_ID_HINTS}):
+                id_columns.append(column)
+        selected = [
+            c for c in header
+            if str(c).lower().replace(" ", "") in accepted or c in id_columns
+        ]
+        # Unknown single-column lineup ID formats still need to be detected;
+        # keep the old robust read as a fallback for those uncommon schemas.
+        usecols = selected if id_columns else None
+        part = pd.read_csv(
+            path, compression="gzip", low_memory=False,
+            usecols=usecols,
+        )
         part.columns = [str(c).strip() for c in part.columns]
         part["_file"] = path.name
         frames.append(part)
@@ -4686,6 +4861,7 @@ def build_lineup_training(_data, _lineups, _zfeat, _pools, base_cols, cache_key)
 
     prof["Season"] = Lm["Season"].to_numpy()
     prof["Tm"] = (Lm["TeamId"] + ":" + Lm["LineupKey"]).to_numpy()
+    prof["LineupKey"] = Lm["LineupKey"].to_numpy()
     prof["Team"] = Lm["Team"].to_numpy()
     prof["Core five"] = Lm["Names"].to_numpy()
     prof["Minutes"] = Lm["Minutes"].to_numpy()
