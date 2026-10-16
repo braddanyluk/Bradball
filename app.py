@@ -3854,8 +3854,8 @@ _LINEUP_ALIASES = {
     "Team": ["team", "teamabbreviation", "team_abbreviation", "teamabbr", "tm", "teamname"],
     "TeamId": ["teamid", "team_id"],
     "Minutes": ["minutes", "min", "mins", "minutesplayed", "minutes_played"],
-    "OffRtg": ["offrtg", "off_rtg", "offrating", "off_rating", "ortg", "offensiverating"],
-    "DefRtg": ["defrtg", "def_rtg", "defrating", "def_rating", "drtg", "defensiverating"],
+    "OffRtg": ["offrtg", "off_rtg", "offrating", "off_rating", "ortg", "offensiverating", "onoffrtg"],
+    "DefRtg": ["defrtg", "def_rtg", "defrating", "def_rating", "drtg", "defensiverating", "ondefrtg"],
     "NetRtg": ["netrtg", "net_rtg", "netrating", "net_rating", "nrtg"],
     "Fg3Pct": ["fg3pct", "fg3_pct", "fg3%", "3p%", "threepct"],
     "Fg2Pct": ["fg2pct", "fg2_pct", "fg2%", "2p%"],
@@ -4001,6 +4001,7 @@ def load_lineups():
     needed_columns = {"Season", "SeasonType", "Team", "TeamId", "Minutes", "_file"}
     needed_columns.update(LINEUP_RATES)
     needed_columns.update(LINEUP_PCTS)
+    needed_columns.update(["Points", "OpponentPoints", "OffPoss", "DefPoss"])
     d = d[[c for c in d.columns if c in needed_columns]]
 
     # ---- identity columns ----
@@ -4017,12 +4018,42 @@ def load_lineups():
         d["TeamId"] = d["Team"].astype("string")
     d["Team"] = d["Team"].astype("string").str.strip()
 
-    for column in ["Minutes"] + LINEUP_RATES + LINEUP_PCTS:
+    rating_inputs = ["Points", "OpponentPoints", "OffPoss", "DefPoss"]
+    for column in ["Minutes"] + LINEUP_RATES + LINEUP_PCTS + rating_inputs:
         if column in d.columns:
             d[column] = pd.to_numeric(d[column], errors="coerce", downcast="float")
-        else:
+
+    if "OffRtg" not in d.columns or d["OffRtg"].notna().sum() == 0:
+        d["OffRtg"] = np.nan
+    if "Points" in d.columns and "OffPoss" in d.columns:
+        derived = 100 * d["Points"] / d["OffPoss"].where(d["OffPoss"] > 0)
+        d["OffRtg"] = d["OffRtg"].fillna(derived)
+        report["notes"].append("OffRtg filled from Points per 100 offensive possessions where missing.")
+    elif d["OffRtg"].isna().all():
+        report["notes"].append("OffRtg could not be derived; Points or OffPoss is missing.")
+
+    if "DefRtg" not in d.columns or d["DefRtg"].notna().sum() == 0:
+        d["DefRtg"] = np.nan
+    if "OpponentPoints" in d.columns and "DefPoss" in d.columns:
+        derived = 100 * d["OpponentPoints"] / d["DefPoss"].where(d["DefPoss"] > 0)
+        d["DefRtg"] = d["DefRtg"].fillna(derived)
+        report["notes"].append("DefRtg filled from OpponentPoints per 100 defensive possessions where missing.")
+    elif d["DefRtg"].isna().all():
+        report["notes"].append("DefRtg could not be derived; OpponentPoints or DefPoss is missing.")
+
+    if "NetRtg" not in d.columns or d["NetRtg"].notna().sum() == 0:
+        d["NetRtg"] = np.nan
+    derived_net = d["OffRtg"] - d["DefRtg"]
+    if d["NetRtg"].isna().any() and d[["OffRtg", "DefRtg"]].notna().all(axis=1).any():
+        d["NetRtg"] = d["NetRtg"].fillna(derived_net)
+        report["notes"].append("NetRtg filled as OffRtg minus DefRtg where missing.")
+
+    for column in LINEUP_PCTS:
+        if column not in d.columns:
             d[column] = np.nan
             report["notes"].append(f"Column {column} not in the files; left blank.")
+
+    d = d.drop(columns=rating_inputs, errors="ignore")
 
     # ---- keep rows with five distinct players ----
     ok = ids.notna().all(axis=1) & d["Season"].notna() & d["Team"].notna()
@@ -5448,6 +5479,26 @@ st.markdown(
     '</div>',
     unsafe_allow_html=True
 )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
