@@ -1123,6 +1123,27 @@ def _design(features, interactions):
             index += 1
     return pd.DataFrame(values, columns=names, index=features.index)
 
+
+def _builder_design(features, interactions, interaction_cols=(),
+                    interaction_values=None, interaction_frame=None):
+    """Build the compact Team Builder design matrix.
+
+    When explicit player-pair skill features are available, use those as the
+    interaction block instead of expanding every lineup summary into a dense
+    quadratic matrix. This keeps both the model and its RAM use manageable.
+    """
+    if not interactions or not interaction_cols:
+        return _design(features, interactions)
+    design = features.copy()
+    if interaction_frame is not None:
+        extra = interaction_frame.loc[:, list(interaction_cols)].reset_index(drop=True)
+    else:
+        extra = pd.DataFrame(
+            [interaction_values], columns=interaction_cols,
+            index=features.index,
+        )
+    return pd.concat([design, extra], axis=1)
+
 def _ridge_fit(X, y, alpha, w=None):
     if w is None:
         mu = X.mean(axis=0)
@@ -1252,8 +1273,8 @@ def _fit_variant_blocked(X, y, w, season_index, season_fold, k, alphas):
 
 
 @st.cache_resource(show_spinner="Fitting the model across seasons...")
-def fit_builder_models(profiles, feature_cols, target_col, weight_col=None,
-                       carry_cols=(), interaction_cols=()):
+def fit_builder_models(_profiles, feature_cols, target_col, weight_col=None,
+                       carry_cols=(), interaction_cols=(), cache_key=()):
     """Fit additive and interaction models, scored on unseen seasons.
 
     Seasons are split into folds, and each fold is predicted by a model
@@ -1263,7 +1284,7 @@ def fit_builder_models(profiles, feature_cols, target_col, weight_col=None,
     With a weight column (real lineups), rows count in proportion to their
     minutes, since ratings from more minutes are less noisy.
     """
-    data = profiles.dropna(subset=[target_col]).reset_index(drop=True)
+    data = _profiles.dropna(subset=[target_col]).reset_index(drop=True)
     y = data[target_col].to_numpy(float)
     interaction_support = None
     if interaction_cols:
@@ -1301,12 +1322,10 @@ def fit_builder_models(profiles, feature_cols, target_col, weight_col=None,
 
     results = {}
     for name, interactions in (("additive", False), ("interact", True)):
-        design = _design(data[feature_cols], interactions)
-        if interactions and interaction_cols:
-            design = pd.concat(
-                [design, data[list(interaction_cols)].reset_index(drop=True)],
-                axis=1,
-            )
+        design = _builder_design(
+            data[feature_cols], interactions, interaction_cols,
+            interaction_frame=data if interactions and interaction_cols else None,
+        )
         X = design.to_numpy(dtype=np.float32, copy=False)
 
         if blocked:
@@ -1552,6 +1571,7 @@ def render_team_builder(df, player_labels, player_options):
         results = fit_builder_models(
             merged, feature_cols, "_target", "weight", ("Team", "Minutes"),
             interaction_cols=tuple(pools.get("interaction_cols", ())),
+            cache_key=(_lineup_cache_key(), target_label, tuple(feature_cols)),
         )
     else:
         feature_cols = [
@@ -1592,6 +1612,7 @@ def render_team_builder(df, player_labels, player_options):
         results = fit_builder_models(
             merged, feature_cols, "_target",
             interaction_cols=tuple(pools.get("interaction_cols", ())),
+            cache_key=(_lineup_cache_key(), target_label, tuple(feature_cols)),
         )
 
     additive, interact = results["additive"], results["interact"]
@@ -1976,16 +1997,12 @@ def render_team_builder(df, player_labels, player_options):
                                 support["lo"][i] - raw_vec[i]))
 
         def model_output(vector, pair_values=None):
-            row = _design(
-                pd.DataFrame([vector], columns=feature_cols),
-                active_key == "interact",
+            feature_row = pd.DataFrame([vector], columns=feature_cols)
+            row = _builder_design(
+                feature_row, active_key == "interact", interaction_cols,
+                pair_values=(pair_interaction_vec if pair_values is None
+                             else pair_values),
             )
-            if active_key == "interact" and interaction_cols:
-                pair_row = pd.DataFrame(
-                    [pair_interaction_vec if pair_values is None else pair_values],
-                    columns=interaction_cols,
-                )
-                row = pd.concat([row.reset_index(drop=True), pair_row], axis=1)
             row = row[active["columns"]]
             values = row.to_numpy(float)
             return values, float(_ridge_predict(active["model"], values)[0])
@@ -2287,15 +2304,12 @@ def render_team_builder(df, player_labels, player_options):
         # ---- How this number was built ----
         def model_for(key, vector, pair_values=None):
             info = results[key]
-            row = _design(
-                pd.DataFrame([vector], columns=feature_cols), key == "interact"
+            row = _builder_design(
+                pd.DataFrame([vector], columns=feature_cols), key == "interact",
+                interaction_cols,
+                pair_values=(pair_interaction_vec if pair_values is None
+                             else pair_values),
             )
-            if key == "interact" and interaction_cols:
-                pair_row = pd.DataFrame(
-                    [pair_interaction_vec if pair_values is None else pair_values],
-                    columns=interaction_cols,
-                )
-                row = pd.concat([row.reset_index(drop=True), pair_row], axis=1)
             row = row[info["columns"]]
             return float(_ridge_predict(info["model"], row.to_numpy(float))[0])
 
@@ -4640,11 +4654,13 @@ def build_lineup_training(_data, _lineups, _zfeat, _pools, base_cols, cache_key)
     interaction_axes = _pools.get("interaction_axes")
     interaction_cols = _pools.get("interaction_cols", [])
     if interaction_axes is not None and interaction_axes.shape[1] and interaction_cols:
+        keep_for_model = (Lm["Minutes"] >= LINEUP_MODEL_MIN_MINUTES).to_numpy()
         player_axis_scores = zvals @ interaction_axes
-        lineup_axis_scores = player_axis_scores[zpos]
+        lineup_axis_scores = player_axis_scores[zpos[keep_for_model]]
         pair_values = _builder_pair_interactions(lineup_axis_scores)
         for i, column in enumerate(interaction_cols):
-            prof[column] = pair_values[:, i]
+            prof[column] = np.nan
+            prof.loc[keep_for_model, column] = pair_values[:, i]
     feature_index = {c: i for i, c in enumerate(base_cols)}
     for label, feature, how in ROLE_FEATURES:
         if feature in feature_index:
@@ -4720,7 +4736,10 @@ def legacy_scale_check(df, zfeat, profiles, training, feature_cols, target_label
     if merged["_target"].notna().sum() < 100:
         return None
 
-    fitted = fit_builder_models(merged, team_cols, "_target")
+    fitted = fit_builder_models(
+        merged, team_cols, "_target",
+        cache_key=(_lineup_cache_key(), "legacy", target_label, tuple(team_cols)),
+    )
     predicted = _ridge_predict(
         fitted["additive"]["model"], training[team_cols].to_numpy(float)
     )
