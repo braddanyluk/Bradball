@@ -1999,8 +1999,8 @@ def render_team_builder(df, player_labels, player_options):
             feature_row = pd.DataFrame([vector], columns=feature_cols)
             row = _builder_design(
                 feature_row, active_key == "interact", interaction_cols,
-                pair_values=(pair_interaction_vec if pair_values is None
-                             else pair_values),
+                interaction_values=(pair_interaction_vec if pair_values is None
+                                    else pair_values),
             )
             row = row[active["columns"]]
             values = row.to_numpy(float)
@@ -2306,8 +2306,8 @@ def render_team_builder(df, player_labels, player_options):
             row = _builder_design(
                 pd.DataFrame([vector], columns=feature_cols), key == "interact",
                 interaction_cols,
-                pair_values=(pair_interaction_vec if pair_values is None
-                             else pair_values),
+                interaction_values=(pair_interaction_vec if pair_values is None
+                                    else pair_values),
             )
             row = row[info["columns"]]
             return float(_ridge_predict(info["model"], row.to_numpy(float))[0])
