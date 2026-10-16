@@ -1085,7 +1085,7 @@ def apply_pool_limits(data, zfeat, pools, rows, feature_cols):
             "Resource": name,
             "Five players would use": wanted,
             "Typical top five": typical,
-            "Most ever": cap,
+            "Observed 99th pct cap": cap,
             "Everyone scaled to": factor,
         })
 
@@ -1643,11 +1643,13 @@ def render_team_builder(df, player_labels, player_options):
     st.markdown("#### How good is the model?")
 
     m1, m2, m3 = st.columns(3)
-    m1.metric("Sum of parts (unseen seasons)", f"{additive['r2']:.1%}")
-    m2.metric("Player-pair skill fit (unseen seasons)", f"{interact['r2']:.1%}")
+    m1.metric("Sum of parts R² (held-out seasons)", f"{additive['r2']:.1%}")
+    m2.metric("Player-pair skill fit R² (held-out seasons)", f"{interact['r2']:.1%}")
     m3.metric(
-        "Typical error",
-        f"±{min(additive['rmse'], interact['rmse']):.1f} pts/100",
+        "RMSE: sum / pair model",
+        f"±{additive['rmse']:.1f} / ±{interact['rmse']:.1f} pts/100",
+        help="Root mean squared prediction error on held-out seasons. "
+             "These are outcome errors, not uncertainty bands for one lineup.",
     )
 
     gain = interact["r2"] - additive["r2"]
@@ -1673,10 +1675,10 @@ def render_team_builder(df, player_labels, player_options):
         st.caption(
             f"Learned from {lineup_info['training_lineups']:,} real five-man "
             f"lineups ({lineup_info['training_minutes']:,.0f} minutes), "
-            "weighted by minutes. The percentage is the share of "
-            "lineup-to-lineup differences within a season that the model "
-            "predicts correctly on seasons it never trained on. Five-man "
-            "ratings are noisy, so a modest number is normal."
+            "weighted by minutes. R² is the share of variation in held-out "
+            "lineup ratings explained compared with predicting the weighted "
+            "average. A score around 17% means modest predictive signal, not "
+            "17% of lineups predicted correctly. Five-man ratings are noisy."
         )
         with st.expander("How did the older team-based method do on real lineups?"):
             check = legacy_scale_check(
@@ -1705,10 +1707,10 @@ def render_team_builder(df, player_labels, player_options):
                 )
     else:
         st.caption(
-            "The percentage is the share of team-to-team differences within "
-            "a season that the model predicts correctly on seasons it never "
-            "trained on. Real basketball has plenty this model can't see, so "
-            "a modest number is normal."
+            "R² is the share of variation in held-out team results explained "
+            "compared with predicting the weighted average. It is not the "
+            "percentage of teams predicted correctly. Real basketball has "
+            "many factors this model cannot see."
         )
 
     use_pair_layer = False
@@ -1875,13 +1877,14 @@ def render_team_builder(df, player_labels, player_options):
         )
     with mode_col2:
         limit_pools = st.checkbox(
-            "Apply shared-resource limits",
+            "Apply historical volume caps",
             value=True,
             key="builder_pools",
-            help="Five players can't all keep their full share of the "
-                 "shots, assists and rebounds. This scales shares down "
-                 "when the group wants more than any real top five has "
-                 "ever used.",
+            help="A heuristic: if the five players' summed per-100 rates "
+                 "exceed the 99th percentile seen in historical lineups, "
+                 "the app scales every player's rate in that category down "
+                 "by the same proportion. It does not measure how a player's "
+                 "rate changes beside a particular teammate.",
         )
     strict = guardrail_mode.startswith("Strict")
 
@@ -2083,11 +2086,12 @@ def render_team_builder(df, player_labels, player_options):
                  "average team of the same season.",
         )
         r2.metric(
-            "Likely range (80%)",
+            "Approx. 80% model range",
             "Capped" if capped_by_history else f"{low:+.1f} to {high:+.1f}",
-            help="Combines ordinary prediction error with how much the "
-                 "model's own estimates wobble for a lineup like this. A "
-                 "wide range means the model doesn't know.",
+            help="Combines held-out prediction error with variation across "
+                 "season-resampled fits, then uses a normal-error multiplier. "
+                 "It has not been calibrated to contain 80% of future lineup "
+                 "results. A wide range means the estimate is weak.",
         )
         r3.metric(
             "How unusual is this group?",
@@ -2101,6 +2105,13 @@ def render_team_builder(df, player_labels, player_options):
                 "The skill-interaction model remains active for this unusual "
                 "group. Treat the prediction cautiously; strict mode clips "
                 "the interaction inputs to the training range."
+            )
+
+        if high - low >= 20:
+            st.warning(
+                "This model range is wide enough that the prediction does "
+                "not reliably distinguish a strong lineup from a weak one. "
+                "Treat the point estimate as exploratory."
             )
 
         if use_lineups:
@@ -2118,12 +2129,14 @@ def render_team_builder(df, player_labels, player_options):
         scaled_any = any(r["Everyone scaled to"] < 0.98 for r in pool_report)
 
         if scaled_any:
-            st.markdown("#### Not enough to go around")
+            st.markdown("#### Historical volume caps")
             st.write(
-                "Per-100 stats assume a player keeps his usual share. "
-                "Together these five want more of some things than any "
-                "real top five has ever had, so everyone's slice was "
-                "shrunk to fit."
+                "The five players' season per-100 rates add up above the "
+                "historical cap for these categories. The app proportionally "
+                "reduces every player's rate in each affected category. "
+                "This is a conservative heuristic based on summed rates, "
+                "not a measured teammate effect. Turn it off above to see "
+                "the prediction without these caps."
             )
             pool_table = pd.DataFrame(pool_report)
             shown = pool_table[pool_table["Everyone scaled to"] < 0.98]
@@ -2131,25 +2144,27 @@ def render_team_builder(df, player_labels, player_options):
                 shown.style.format({
                     "Five players would use": "{:.1f}",
                     "Typical top five": "{:.1f}",
-                    "Most ever": "{:.1f}",
+                    "Observed 99th pct cap": "{:.1f}",
                     "Everyone scaled to": "{:.0%}",
                 }),
                 use_container_width=True,
                 hide_index=True,
             )
             st.caption(
-                "Units are per 100 possessions, summed across the five. "
-                "Efficiency stats (like 3P%) are left alone, which is "
-                "probably generous: real players usually shoot a bit "
-                "worse when asked to do more."
+                "The cap is usually the 99th percentile of summed player "
+                "rates in historical lineups; if there are too few such "
+                "lineups, the team top-five distribution is used. It does "
+                "not establish that blocks, steals, or rebounds actually "
+                "fall by this amount when these specific players share the "
+                "floor. Percentages such as 3P% are not capped."
             )
         elif pool_report:
-            with st.expander("Shared resources (nothing needed scaling)"):
+            with st.expander("Historical volume caps (nothing needed scaling)"):
                 st.dataframe(
                     pd.DataFrame(pool_report).style.format({
                         "Five players would use": "{:.1f}",
                         "Typical top five": "{:.1f}",
-                        "Most ever": "{:.1f}",
+                        "Observed 99th pct cap": "{:.1f}",
                         "Everyone scaled to": "{:.0%}",
                     }),
                     use_container_width=True,
@@ -2332,9 +2347,9 @@ def render_team_builder(df, player_labels, player_options):
             ("Skill interactions, including player-pair fit",
              active_unscaled - skills_only,
              "Credit or penalty learned from how skills combine across the five players."),
-            ("Not enough to go around", active_limited - active_unscaled,
-             "Shots, assists and rebounds trimmed where the five want more "
-             "than any real top five has used."),
+            ("Historical volume caps", active_limited - active_unscaled,
+             "Proportional adjustment to summed per-100 rates; heuristic, "
+             "not a measured teammate effect."),
             ("Stretching to match history", (calib_scale - 1.0) * active_limited,
              "Calibration correction, if switched on."),
             ("Pair chemistry", synergy_effect,
