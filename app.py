@@ -1128,13 +1128,12 @@ def _builder_design(features, interactions, interaction_cols=(),
                     interaction_values=None, interaction_frame=None):
     """Build the compact Team Builder design matrix.
 
-    When explicit player-pair skill features are available, use those as the
-    interaction block instead of expanding every lineup summary into a dense
-    quadratic matrix. This keeps both the model and its RAM use manageable.
+    Keep the broad quadratic interactions among lineup summaries, and append
+    explicit player-pair skill features when available.
     """
     if not interactions or not interaction_cols:
         return _design(features, interactions)
-    design = features.copy()
+    design = _design(features, True)
     if interaction_frame is not None:
         extra = interaction_frame.loc[:, list(interaction_cols)].reset_index(drop=True)
     else:
